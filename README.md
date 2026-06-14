@@ -42,9 +42,8 @@ The project also includes tools for label mapping, process editing, AOI golden s
 Screenshots should be placed in:
 
 
-
 ```text
-docs/screenshots/
+images
 ```
 
 Good screenshots to add:
