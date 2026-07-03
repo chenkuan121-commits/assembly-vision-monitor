@@ -127,17 +127,8 @@ class NGProductTracker:
         cp = self.current_product
         if cp and step_idx < len(cp['step_records']):
             current_status = cp['step_records'][step_idx]['status']
-            if current_status == 'skipped':
-                cp['step_records'][step_idx]['status'] = 'remedied'
-                cp['step_records'][step_idx]['reason'] = '跳步后已补救'
-            elif current_status == 'pending':
-                # 👇 检查之前有没有触发过跳步告警，如果有，就算“补救成功”
-                alarms = cp.get('jump_alarms', [])
-                if any(a['current_step'] == step_idx + 1 for a in alarms):
-                    cp['step_records'][step_idx]['status'] = 'remedied'
-                    cp['step_records'][step_idx]['reason'] = '跳步后已补救'
-                else:
-                    cp['step_records'][step_idx]['status'] = 'completed'
+            if current_status == 'pending':
+                cp['step_records'][step_idx]['status'] = 'completed'
 
         # 👇 核心洗白逻辑：只要步骤正常做完了，去查一下有没有坏账（跳过的步骤）
 
@@ -148,11 +139,13 @@ class NGProductTracker:
             cp['step_records'][step_idx]['reason'] = reason
         self._mark_ng(reason)
         
-    def mark_step_remedied(self, step_idx):
+    def mark_step_remedied(self, step_idx, reason='跳步后已补救'):
         cp = self.current_product
         if cp and step_idx < len(cp['step_records']):
             cp['step_records'][step_idx]['status'] = 'remedied'
-            cp['step_records'][step_idx]['reason'] = '跳步后已补救'
+            cp['step_records'][step_idx]['reason'] = reason
+            cp['step_records'][step_idx]['remedied_at'] = datetime.now().strftime("%H:%M:%S")
+            cp['step_records'][step_idx]['manual_remediation'] = True
 
     def mark_step_timeout(self, step_idx, timeout_sec):
         cp = self.current_product
@@ -166,7 +159,7 @@ class NGProductTracker:
             return []
         return [i for i, rec in enumerate(cp['step_records']) if rec['status'] == 'skipped']
 
-    def add_jump_alarm(self, step_idx, alarm_msg):
+    def add_jump_alarm(self, step_idx, alarm_msg, jumped_to_idx=None, skipped_indices=None):
         cp = self.current_product
         if not cp: return
         now = datetime.now()
@@ -178,11 +171,16 @@ class NGProductTracker:
             if (last['current_step'] == step_idx + 1 and last['msg'] == alarm_msg
                     and 0 <= now_seconds - prev_seconds < 2):
                 return
-        cp['jump_alarms'].append({
+        alarm = {
             'time': now.strftime("%H:%M:%S"),
             'current_step': step_idx + 1,
             'msg': alarm_msg,
-        })
+        }
+        if jumped_to_idx is not None:
+            alarm['jumped_to_step'] = jumped_to_idx + 1
+        if skipped_indices:
+            alarm['skipped_steps'] = [i + 1 for i in skipped_indices]
+        cp['jump_alarms'].append(alarm)
 
         # 👇 新增：只要触发了跳步告警，立刻将当前产品盖章为 NG！
         self._mark_ng("触发跳步告警")

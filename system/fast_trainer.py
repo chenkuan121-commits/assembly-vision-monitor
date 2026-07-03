@@ -7,6 +7,7 @@ import cv2
 import json
 import shutil
 import random
+import tempfile
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
@@ -34,6 +35,17 @@ def get_training_device_info():
     except Exception as exc:
         print(f"[VisionCodex][Device] Training CUDA check failed, using CPU: {exc}", flush=True)
     return "cpu", "CPU", None
+
+
+def get_training_gpu_memory_gb():
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            props = torch.cuda.get_device_properties(0)
+            return props.total_memory / (1024 ** 3)
+    except Exception:
+        pass
+    return None
 
 
 def log_training_device(message):
@@ -92,6 +104,307 @@ SPECIAL_CLASS_ALIASES = {
 }
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp')
+DEFAULT_FRAME_TRANSFORM = "none"
+
+# 红黑/黑红等方向敏感类别严禁镜像增强。集中声明便于测试，避免升级 Ultralytics
+# 后重新落回其默认 fliplr=0.5；Copy-Paste 的默认模式也可能使用 flip，因此显式关闭。
+DIRECTION_SAFE_TRAINING_AUGMENTATION = {
+    "mosaic": 1.0,
+    "mixup": 0.1,
+    "degrees": 15.0,
+    "translate": 0.1,
+    "scale": 0.5,
+    "hsv_h": 0.015,
+    "hsv_s": 0.7,
+    "hsv_v": 0.4,
+    "fliplr": 0.0,
+    "flipud": 0.0,
+    "copy_paste": 0.0,
+}
+
+
+class DatasetImportError(ValueError):
+    """导入的数据集缺少必要信息或不是当前标注器支持的格式。"""
+
+
+def _read_text_with_fallback(path):
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise DatasetImportError(f"无法读取类别文件编码: {path} ({last_error})")
+
+
+def _normalize_imported_class_names(raw_names, metadata_path, declared_nc=None):
+    if isinstance(raw_names, dict):
+        indexed = {}
+        for key, value in raw_names.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                raise DatasetImportError(f"类别编号不是整数: {key}（{metadata_path}）")
+            indexed[idx] = str(value).strip()
+        expected = list(range(len(indexed)))
+        if sorted(indexed) != expected:
+            raise DatasetImportError(
+                f"类别编号必须从 0 连续排列，当前为 {sorted(indexed)}（{metadata_path}）"
+            )
+        names = [indexed[i] for i in expected]
+    elif isinstance(raw_names, (list, tuple)):
+        names = [str(value).strip() for value in raw_names]
+    else:
+        raise DatasetImportError(f"类别 names 必须是列表或编号字典（{metadata_path}）")
+
+    if not names or any(not name for name in names):
+        raise DatasetImportError(f"类别名称不能为空（{metadata_path}）")
+    if declared_nc is not None:
+        try:
+            declared_nc = int(declared_nc)
+        except (TypeError, ValueError):
+            raise DatasetImportError(f"nc 不是有效整数（{metadata_path}）")
+        if declared_nc != len(names):
+            raise DatasetImportError(
+                f"nc={declared_nc}，但 names 中有 {len(names)} 个类别（{metadata_path}）"
+            )
+    return names
+
+
+def load_imported_class_names(source_dir):
+    """从完整数据集元信息恢复类别，顺序和零样本类别都以元信息为准。"""
+    source_dir = os.path.abspath(source_dir)
+    class_files = [
+        os.path.join(source_dir, "classes.txt"),
+        os.path.join(source_dir, "labels", "classes.txt"),
+        os.path.join(source_dir, "obj.names"),
+        os.path.join(source_dir, "classes.names"),
+    ]
+    for path in class_files:
+        if not os.path.isfile(path):
+            continue
+        names = [line.strip() for line in _read_text_with_fallback(path).splitlines() if line.strip()]
+        if names:
+            return names, path
+
+    yaml_candidates = []
+    for filename in ("dataset.yaml", "data.yaml", "dataset.yml", "data.yml"):
+        path = os.path.join(source_dir, filename)
+        if os.path.isfile(path):
+            yaml_candidates.append(path)
+    if not yaml_candidates:
+        for filename in sorted(os.listdir(source_dir)):
+            if filename.lower().endswith((".yaml", ".yml")):
+                yaml_candidates.append(os.path.join(source_dir, filename))
+
+    if yaml_candidates and _yaml_lib is None:
+        raise DatasetImportError("读取 data.yaml 需要 PyYAML，请先安装 pyyaml")
+    yaml_errors = []
+    for path in yaml_candidates:
+        try:
+            data = _yaml_lib.safe_load(_read_text_with_fallback(path)) or {}
+            if not isinstance(data, dict) or "names" not in data:
+                continue
+            names = _normalize_imported_class_names(data["names"], path, data.get("nc"))
+            return names, path
+        except DatasetImportError as exc:
+            yaml_errors.append(str(exc))
+        except Exception as exc:
+            yaml_errors.append(f"无法解析 {path}: {exc}")
+
+    if yaml_errors:
+        raise DatasetImportError("\n".join(yaml_errors))
+    raise DatasetImportError(
+        "没有找到类别元信息。请导入包含 images、labels 和 data.yaml/dataset.yaml/classes.txt 的完整项目；"
+        "仅有图片和标签数字 ID，无法还原原来的中文类别名或零样本类别。"
+    )
+
+
+def _dataset_root_pairs(source_dir):
+    """兼容 images/labels 和 train/images + train/labels 两类常见 YOLO 目录。"""
+    images_dir = os.path.join(source_dir, "images")
+    labels_dir = os.path.join(source_dir, "labels")
+    if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+        return [(images_dir, labels_dir, "")]
+
+    pairs = []
+    for root, dirs, _ in os.walk(source_dir):
+        rel_root = os.path.relpath(root, source_dir)
+        if rel_root != "." and len(rel_root.split(os.sep)) > 3:
+            dirs[:] = []
+            continue
+        if os.path.basename(root).lower() != "images":
+            continue
+        sibling_labels = os.path.join(os.path.dirname(root), "labels")
+        if os.path.isdir(sibling_labels):
+            prefix = os.path.relpath(os.path.dirname(root), source_dir)
+            pairs.append((root, sibling_labels, "" if prefix == "." else prefix))
+            dirs[:] = []
+    if not pairs:
+        raise DatasetImportError(
+            "没有找到成对的 images 和 labels 目录。请选择完整 YOLO 数据集的根目录。"
+        )
+    return pairs
+
+
+def _flat_import_name(relative_path, prefix=""):
+    relative_path = os.path.normpath(relative_path)
+    parts = [] if prefix in ("", ".") else os.path.normpath(prefix).split(os.sep)
+    parts.extend(relative_path.split(os.sep))
+    return "__".join(part for part in parts if part not in ("", "."))
+
+
+def _iter_import_images(images_root):
+    """根目录已有原图时忽略训练生成的 train/val 副本，否则递归读取分组目录。"""
+    direct_images = [
+        os.path.join(images_root, filename)
+        for filename in sorted(os.listdir(images_root))
+        if os.path.isfile(os.path.join(images_root, filename))
+        and filename.lower().endswith(IMAGE_EXTENSIONS)
+    ]
+    if direct_images:
+        return direct_images
+
+    images = []
+    for root, _, files in os.walk(images_root):
+        for filename in sorted(files):
+            if filename.lower().endswith(IMAGE_EXTENSIONS):
+                images.append(os.path.join(root, filename))
+    return images
+
+
+def inspect_yolo_obb_dataset(source_dir):
+    """校验并描述一个可导入的 YOLO OBB 数据集，不写入任何文件。"""
+    source_dir = os.path.abspath(source_dir)
+    if os.path.basename(os.path.normpath(source_dir)).lower() == "images":
+        parent = os.path.dirname(source_dir)
+        if os.path.isdir(os.path.join(parent, "labels")):
+            source_dir = parent
+    if not os.path.isdir(source_dir):
+        raise DatasetImportError(f"数据集目录不存在: {source_dir}")
+
+    class_names, metadata_path = load_imported_class_names(source_dir)
+    root_pairs = _dataset_root_pairs(source_dir)
+    items = []
+    seen_images = set()
+    used_names = set()
+    used_stems = set()
+    box_counts = [0] * len(class_names)
+    empty_label_files = 0
+    unlabeled_images = 0
+
+    for images_root, labels_root, prefix in root_pairs:
+        for discovered_image_path in _iter_import_images(images_root):
+            image_path = os.path.abspath(discovered_image_path)
+            image_key = os.path.normcase(image_path)
+            if image_key in seen_images:
+                continue
+            seen_images.add(image_key)
+            rel_image = os.path.relpath(image_path, images_root)
+            rel_label = os.path.splitext(rel_image)[0] + ".txt"
+            label_path = os.path.join(labels_root, rel_label)
+
+            dest_image_name = _flat_import_name(rel_image, prefix)
+            candidate_stem, candidate_ext = os.path.splitext(dest_image_name)
+            unique_name = dest_image_name
+            suffix = 2
+            while (
+                unique_name.lower() in used_names
+                or os.path.splitext(unique_name)[0].lower() in used_stems
+            ):
+                unique_name = f"{candidate_stem}__{suffix}{candidate_ext}"
+                suffix += 1
+            used_names.add(unique_name.lower())
+            used_stems.add(os.path.splitext(unique_name)[0].lower())
+
+            label_exists = os.path.isfile(label_path)
+            if label_exists:
+                content = _read_text_with_fallback(label_path)
+                nonempty_lines = [line.strip() for line in content.splitlines() if line.strip()]
+                if not nonempty_lines:
+                    empty_label_files += 1
+                for line_no, line in enumerate(nonempty_lines, 1):
+                    parts = line.split()
+                    if len(parts) < 9:
+                        raise DatasetImportError(
+                            f"不是 OBB 标签（至少应有 9 列）: {label_path}:{line_no}。"
+                            "当前快速训练只支持 YOLO OBB 旋转框。"
+                        )
+                    try:
+                        cls_value = float(parts[0])
+                        cls_id = int(cls_value)
+                        if cls_value != cls_id:
+                            raise ValueError
+                        [float(value) for value in parts[1:9]]
+                    except ValueError:
+                        raise DatasetImportError(f"标签内容不是有效数字: {label_path}:{line_no}")
+                    if cls_id < 0 or cls_id >= len(class_names):
+                        raise DatasetImportError(
+                            f"标签类别 ID {cls_id} 超出元信息范围 0~{len(class_names) - 1}: "
+                            f"{label_path}:{line_no}"
+                        )
+                    box_counts[cls_id] += 1
+            else:
+                unlabeled_images += 1
+
+            items.append({
+                "image_path": image_path,
+                "label_path": label_path if label_exists else None,
+                "dest_image_name": unique_name,
+                "dest_label_name": os.path.splitext(unique_name)[0] + ".txt",
+            })
+
+    if not items:
+        raise DatasetImportError("images 目录中没有找到支持的图片文件")
+    return {
+        "source_dir": source_dir,
+        "metadata_path": metadata_path,
+        "class_names": class_names,
+        "items": items,
+        "box_counts": box_counts,
+        "empty_label_files": empty_label_files,
+        "unlabeled_images": unlabeled_images,
+    }
+
+
+def import_yolo_obb_project(source_dir, destination_dir):
+    """将外部数据集转换成快速训练使用的扁平项目目录，创建过程保持原子性。"""
+    report = inspect_yolo_obb_dataset(source_dir)
+    destination_dir = os.path.abspath(destination_dir)
+    if os.path.exists(destination_dir):
+        raise DatasetImportError(f"目标项目已经存在: {destination_dir}")
+    parent_dir = os.path.dirname(destination_dir)
+    os.makedirs(parent_dir, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(prefix=".importing_", dir=parent_dir)
+    try:
+        images_dir = os.path.join(staging_dir, "images")
+        labels_dir = os.path.join(staging_dir, "labels")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        os.makedirs(os.path.join(staging_dir, "recordings"), exist_ok=True)
+        for item in report["items"]:
+            shutil.copy2(item["image_path"], os.path.join(images_dir, item["dest_image_name"]))
+            if item["label_path"]:
+                shutil.copy2(item["label_path"], os.path.join(labels_dir, item["dest_label_name"]))
+        with open(os.path.join(staging_dir, "classes.txt"), "w", encoding="utf-8") as f:
+            for name in report["class_names"]:
+                f.write(f"{name}\n")
+        with open(os.path.join(staging_dir, "import_info.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "source_dir": report["source_dir"],
+                "metadata_path": report["metadata_path"],
+                "imported_at": datetime.now().isoformat(timespec="seconds"),
+                "class_names": report["class_names"],
+                "box_counts": report["box_counts"],
+                "image_count": len(report["items"]),
+                "unlabeled_images": report["unlabeled_images"],
+            }, f, ensure_ascii=False, indent=2)
+        os.replace(staging_dir, destination_dir)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    return report
 
 
 def apply_frame_transform(frame, transform_mode):
@@ -152,6 +465,9 @@ class AnnotatorWidget(QLabel):
         self.action_state = "IDLE"  # IDLE, DRAWING, MOVING, ROTATING
         self.drag_start_pos = None
         self.temp_box_state = None
+        self.pan_start_pos = None
+        self.pan_start_scroll = None
+        self.pan_scroll_area = None
 
         self.class_names = []
         self.class_colors = {}
@@ -244,6 +560,52 @@ class AnnotatorWidget(QLabel):
             return
         super().wheelEvent(ev)
 
+    def _find_scroll_area(self):
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def _begin_canvas_pan(self, x, y):
+        scroll = self._find_scroll_area()
+        if scroll is None:
+            return False
+        self.action_state = "PANNING"
+        self.pan_scroll_area = scroll
+        self.pan_start_pos = (int(x), int(y))
+        self.pan_start_scroll = (
+            scroll.horizontalScrollBar().value(),
+            scroll.verticalScrollBar().value(),
+        )
+        self.setCursor(Qt.ClosedHandCursor)
+        return True
+
+    def _pan_canvas_to(self, x, y):
+        if (self.action_state != "PANNING" or self.pan_scroll_area is None
+                or self.pan_start_pos is None or self.pan_start_scroll is None):
+            return False
+        dx = int(x) - self.pan_start_pos[0]
+        dy = int(y) - self.pan_start_pos[1]
+        self.pan_scroll_area.horizontalScrollBar().setValue(
+            self.pan_start_scroll[0] - dx
+        )
+        self.pan_scroll_area.verticalScrollBar().setValue(
+            self.pan_start_scroll[1] - dy
+        )
+        return True
+
+    def _end_canvas_pan(self):
+        if self.action_state != "PANNING":
+            return False
+        self.action_state = "IDLE"
+        self.pan_start_pos = None
+        self.pan_start_scroll = None
+        self.pan_scroll_area = None
+        self.unsetCursor()
+        return True
+
     def to_original(self, x, y):
         ox = (x - self.offset_x) / self.scale_factor
         oy = (y - self.offset_y) / self.scale_factor
@@ -288,6 +650,13 @@ class AnnotatorWidget(QLabel):
         self.setFocus()
         if self.scaled_pixmap is None: return
         mx, my = ev.pos().x(), ev.pos().y()
+
+        if (ev.button() == Qt.LeftButton
+                and ev.modifiers() & Qt.ControlModifier
+                and self._begin_canvas_pan(mx, my)):
+            ev.accept()
+            return
+
         ox, oy = self.to_original(mx, my)
 
         # 🎯 SAM 智能修正逻辑：如果选中了框，就覆盖它；没选中，就新建
@@ -342,6 +711,12 @@ class AnnotatorWidget(QLabel):
     def mouseMoveEvent(self, ev: QMouseEvent):
         if self.scaled_pixmap is None: return
         mx, my = ev.pos().x(), ev.pos().y()
+
+        if self.action_state == "PANNING":
+            self._pan_canvas_to(mx, my)
+            ev.accept()
+            return
+
         ox, oy = self.to_original(mx, my)
 
         if self.action_state == "DRAWING":
@@ -405,6 +780,10 @@ class AnnotatorWidget(QLabel):
                 self.update()
 
     def mouseReleaseEvent(self, ev: QMouseEvent):
+        if self._end_canvas_pan():
+            ev.accept()
+            return
+
         # 💡核心修复：加入 "RESIZING" 状态，确保松开鼠标后无论如何都能回到 "IDLE" 空闲状态
         if self.action_state in ["DRAWING", "MOVING", "ROTATING", "RESIZING"]:
             if self.action_state == "DRAWING" and self.selected_box_idx >= 0:
@@ -666,6 +1045,10 @@ class TrainWorker(QThread):
             run_dir = os.path.join(runs_dir, run_name)
             self.progress.emit(f"🚀 开始 OBB 训练 (epochs={self.epochs}, imgsz={self.imgsz}, batch={self.batch})")
             self.progress.emit(f"📁 本次训练输出目录: {run_dir}")
+            self.progress.emit(
+                "🧭 方向敏感保护：左右翻转=0、上下翻转=0、Copy-Paste=0，"
+                "避免把红黑顺序变成黑红顺序"
+            )
 
             writer = _SignalWriter(self.progress)
             try:
@@ -680,17 +1063,8 @@ class TrainWorker(QThread):
                         name=run_name,
                         exist_ok=False,
                         device=train_device,
-                        # 👇 [新增] YOLO 自带的强大在线数据增强参数
-                        mosaic=1.0,  # 100% 开启马赛克增强 (对微小缺陷极其有效)
-                        mixup=0.1,  # 10% 概率开启 MixUp
-                        degrees=15.0,  # 随机旋转 ±15 度
-                        translate=0.1,  # 随机平移 10%
-                        scale=0.5,  # 随机缩放 ±50%
-                        hsv_h=0.015,  # 色调随机扭曲
-                        hsv_s=0.7,  # 饱和度随机扭曲
-                        hsv_v=0.4,  # 亮度随机扭曲
-                        fliplr=0.5,  # 50% 概率水平翻转
                         workers=0,
+                        **DIRECTION_SAFE_TRAINING_AUGMENTATION,
                     )
             finally:
                 writer.flush()
@@ -728,7 +1102,7 @@ class FastTrainerDialog(QDialog):
         self.capture_timer.timeout.connect(self._update_preview)
         self.record_writer = None
         self.recording_video_path = ""
-        self.frame_transform = "none"
+        self.frame_transform = DEFAULT_FRAME_TRANSFORM
         self.playback_cap = None
         self.playback_timer = QTimer()
         self.playback_timer.timeout.connect(self._update_playback)
@@ -815,6 +1189,10 @@ class FastTrainerDialog(QDialog):
         self.combo_frame_transform.addItem("上下翻转", "flip_v")
         self.combo_frame_transform.addItem("左右翻转", "flip_h")
         self.combo_frame_transform.addItem("180°", "rotate_180")
+        self.combo_frame_transform.setToolTip(
+            "这会直接改变并保存采集图片/录像的方向。"
+            "如果红黑与黑红的顺序有不同含义，请保持‘正常’；仅在纠正摄像头原始画面时使用翻转。"
+        )
         self.combo_frame_transform.currentIndexChanged.connect(self._on_frame_transform_changed)
         cam_ctl.addWidget(QLabel("方向:"))
         cam_ctl.addWidget(self.combo_frame_transform)
@@ -851,6 +1229,18 @@ class FastTrainerDialog(QDialog):
         self.btn_new_project.clicked.connect(self._new_project)
         row2.addWidget(self.btn_new_project)
         p_layout.addLayout(row2)
+
+        self.btn_import_project = QPushButton("📥 导入标注项目")
+        self.btn_import_project.setToolTip(
+            "导入包含 images、labels 和 data.yaml/dataset.yaml/classes.txt 的完整 YOLO OBB 数据集，"
+            "保留中文类别名、类别顺序以及没有任何标注框的类别。"
+        )
+        self.btn_import_project.clicked.connect(self._import_project)
+        p_layout.addWidget(self.btn_import_project)
+        import_hint = QLabel("导入完整目录：images/ + labels/ + data.yaml（或 dataset.yaml / classes.txt）")
+        import_hint.setWordWrap(True)
+        import_hint.setStyleSheet("color: #666; font-size: 11px;")
+        p_layout.addWidget(import_hint)
 
         self.lbl_project_info = QLabel("")
         self.lbl_project_info.setWordWrap(True)
@@ -990,7 +1380,10 @@ class FastTrainerDialog(QDialog):
         tool.addWidget(btn_save_next)
         center.addLayout(tool)
 
-        hint = QLabel("左键画框 | 右键SAM | 新框默认未分类 | 选中框后按 0-9/A-Z 赋类别 | Delete删框")
+        hint = QLabel(
+            "左键画框 | Ctrl+滚轮缩放 | Ctrl+左键拖动画面 | 右键SAM | "
+            "新框默认未分类 | 选中框后按 0-9/A-Z 赋类别 | Delete删框"
+        )
         hint.setStyleSheet("color: #aaa; font-size: 11px;")
         center.addWidget(hint)
         layout.addLayout(center, stretch=3)
@@ -1033,6 +1426,33 @@ class FastTrainerDialog(QDialog):
             self.annotator.obb_boxes[self.annotator.selected_box_idx][9] = self.class_names[idx]
             self.annotator.update()
 
+    def _update_training_param_help(self):
+        if not hasattr(self, "spin_imgsz") or not hasattr(self, "spin_batch"):
+            return
+        imgsz = self.spin_imgsz.value()
+        batch = self.spin_batch.value()
+        gpu_mem = get_training_gpu_memory_gb()
+        if gpu_mem:
+            memory_text = f"当前显卡显存约 {gpu_mem:.1f}GB。"
+        else:
+            memory_text = "未检测到可用显卡时会用 CPU 训练，速度会慢很多。"
+
+        if imgsz >= 960 or batch >= 16:
+            suggestion = "当前设置偏吃显存。若训练日志里的 GPU_mem 接近显存上限，先把 Batch 调小；还不够再把 imgsz 调小。"
+        elif imgsz <= 640 and batch <= 8:
+            suggestion = "当前设置比较适合 6GB 显存，通常更稳。"
+        else:
+            suggestion = "当前设置中等。若出现显存不足，优先降低 Batch。"
+
+        self.lbl_train_param_help.setText(
+            "参数说明：基座模型越大，可能越准，但训练更慢、更吃显存；"
+            "Epochs 是训练轮数，轮数越多训练越久；"
+            "imgsz 是训练图片尺寸，越大越能看清小物体，但显存占用明显增加；"
+            "Batch 是一次喂给显卡的图片数量，越大越快，但最容易爆显存。\n"
+            f"显存提示：{memory_text} 6GB 显存建议先用 imgsz=640、Batch=4~8。"
+            f"如果训练输出里的 GPU_mem 接近 6G，或者报 CUDA out of memory，就调小 imgsz 或 Batch。{suggestion}"
+        )
+
     # ═══════════ Tab 3: 训练 ═══════════
     def _create_train_tab(self):
         w = QWidget()
@@ -1072,14 +1492,37 @@ class FastTrainerDialog(QDialog):
         self.spin_imgsz.setRange(320, 1920)
         self.spin_imgsz.setSingleStep(32)
         self.spin_imgsz.setValue(640)
+        self.spin_imgsz.valueChanged.connect(self._update_training_param_help)
         r2.addWidget(self.spin_imgsz)
         r2.addWidget(QLabel("Batch:"))
         self.spin_batch = QSpinBox()
         self.spin_batch.setRange(2, 64)
         self.spin_batch.setValue(8)
+        self.spin_batch.valueChanged.connect(self._update_training_param_help)
         r2.addWidget(self.spin_batch)
         r2.addStretch()
         p_layout.addLayout(r2)
+
+        self.lbl_train_param_help = QLabel()
+        self.lbl_train_param_help.setWordWrap(True)
+        self.lbl_train_param_help.setStyleSheet(
+            "background:#fff7e6; border:1px solid #ffd591; border-radius:6px; "
+            "padding:8px; color:#5f370e; line-height:1.4;"
+        )
+        p_layout.addWidget(self.lbl_train_param_help)
+        self._update_training_param_help()
+
+        self.lbl_direction_safe = QLabel(
+            "🧭 方向敏感保护已启用：训练不会进行左右翻转、上下翻转或翻转式 Copy-Paste，"
+            "红黑与黑红不会被镜像增强混淆。"
+        )
+        self.lbl_direction_safe.setWordWrap(True)
+        self.lbl_direction_safe.setStyleSheet(
+            "background:#e8f7ed; border:1px solid #8fd19e; border-radius:6px; "
+            "padding:8px; color:#155724; font-weight:bold;"
+        )
+        p_layout.addWidget(self.lbl_direction_safe)
+
         params.setLayout(p_layout)
         layout.addWidget(params)
 
@@ -1157,7 +1600,8 @@ class FastTrainerDialog(QDialog):
                     pass
 
         if class_ids:
-            self.class_names = [f"class_{i}" for i in sorted(class_ids)]
+            # 没有元信息时无法恢复原名，但至少必须保留 ID 的原始位置，不能把 0、2 压缩成 0、1。
+            self.class_names = [f"class_{i}" for i in range(max(class_ids) + 1)]
             self._save_classes_to_txt()
             return self.class_names
 
@@ -1196,6 +1640,72 @@ class FastTrainerDialog(QDialog):
         self._refresh_project_list()
         self.edit_new_project.clear()
         self._log(f"已创建项目: {name}")
+
+    def _import_project(self):
+        source_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择完整 YOLO OBB 项目（需包含 images、labels 和类别元信息）",
+            "",
+        )
+        if not source_dir:
+            return
+
+        default_name = os.path.basename(os.path.normpath(source_dir)) or "导入项目"
+        project_name, ok = QInputDialog.getText(
+            self, "导入标注项目", "新项目名称:", text=default_name
+        )
+        if not ok:
+            return
+        project_name = project_name.strip()
+        if not project_name:
+            QMessageBox.warning(self, "提示", "项目名称不能为空")
+            return
+        if project_name in (".", "..") or any(char in project_name for char in '<>:"/\\|?*'):
+            QMessageBox.warning(self, "提示", "项目名称不能包含 \\ / : * ? \" < > | 等字符")
+            return
+        if project_name.endswith((" ", ".")):
+            QMessageBox.warning(self, "提示", "项目名称不能以空格或句点结尾")
+            return
+
+        destination_dir = os.path.join(self._projects_dir(), project_name)
+        if os.path.exists(destination_dir):
+            QMessageBox.warning(self, "提示", f"项目 '{project_name}' 已存在，请换一个名称")
+            return
+
+        self.btn_import_project.setEnabled(False)
+        self.lbl_project_info.setText("⏳ 正在校验并导入标注项目...")
+        try:
+            report = import_yolo_obb_project(source_dir, destination_dir)
+        except DatasetImportError as exc:
+            self.lbl_project_info.setText("❌ 导入失败")
+            QMessageBox.warning(self, "无法导入", str(exc))
+            return
+        except Exception as exc:
+            self.lbl_project_info.setText("❌ 导入失败")
+            QMessageBox.critical(self, "导入失败", f"复制项目时发生错误:\n{exc}")
+            return
+        finally:
+            self.btn_import_project.setEnabled(True)
+
+        self._refresh_project_list()
+        index = self.combo_projects.findText(project_name)
+        if index >= 0:
+            self.combo_projects.setCurrentIndex(index)
+            self._open_project()
+
+        zero_sample_names = [
+            name for name, count in zip(report["class_names"], report["box_counts"]) if count == 0
+        ]
+        zero_sample_text = "、".join(zero_sample_names) if zero_sample_names else "无"
+        summary = (
+            f"已导入 {len(report['items'])} 张图片、{len(report['class_names'])} 个类别。\n"
+            f"零样本类别（已保留）: {zero_sample_text}\n"
+            f"类别来源: {os.path.basename(report['metadata_path'])}"
+        )
+        if report["unlabeled_images"]:
+            summary += f"\n另有 {report['unlabeled_images']} 张图片没有对应标签文件，已作为待标注图片保留。"
+        self._log(f"📥 {summary.replace(chr(10), ' | ')}")
+        QMessageBox.information(self, "导入完成", summary)
 
     def _open_project(self):
         name = self.combo_projects.currentText().strip()
@@ -2022,6 +2532,7 @@ class FastTrainerDialog(QDialog):
         epochs = self.spin_epochs.value()
         imgsz = self.spin_imgsz.value()
         batch = self.spin_batch.value()
+        self._log("💡 显存提示：6GB 显卡训练时请观察日志里的 GPU_mem。接近 6G 或报 CUDA out of memory 时，先调小 Batch，再调小 imgsz。")
 
         self.worker = TrainWorker(yaml_path, model_out, epochs, imgsz, batch, base_model)
         self.worker.progress.connect(self._log)
