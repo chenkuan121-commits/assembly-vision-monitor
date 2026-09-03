@@ -5,11 +5,24 @@ import json
 import cv2
 from workflow_monitor import WorkflowMonitor  # 🌟 新增导入
 from ng_tracker import NGProductTracker   # 🌟 NG 产品追踪
+from derived_obb_relation import (
+    ObbInternalOrderTracker,
+    derived_obb_virtual_mapping,
+    normalize_derived_obb_relation,
+)
+from state_monitor import ToggleStateMonitorEngine
+from slot_monitor import (
+    AnchorSlotMonitorEngine,
+    ResultSequenceMonitorEngine,
+    normalize_step_wiring_check,
+)
 import shutil
 from intent_engine import IntentEngine
 import time
 import math
 import re
+import html
+from collections import deque
 
 def _init_runtime_base_path():
     if not getattr(sys, 'frozen', False):
@@ -47,6 +60,9 @@ def _init_runtime_base_path():
     os.chdir(app_data)
     return app_data
 
+
+
+
 base_path = _init_runtime_base_path()
 import mediapipe as mp
 import numpy as np
@@ -72,6 +88,25 @@ import process_editor
 import fast_trainer
 from logic_engine import ProcessLogicEngine
 from alarm_light import AlarmLightController, list_serial_port_options
+
+
+DETECTION_CLASS_COLORS_RGB = (
+    (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
+    (207, 210, 49), (72, 249, 10), (61, 219, 134), (26, 147, 52),
+    (0, 212, 187), (44, 153, 168), (0, 194, 255), (52, 69, 147),
+    (100, 115, 255), (0, 24, 236), (132, 56, 255), (82, 0, 133),
+    (203, 56, 255), (255, 149, 200), (255, 55, 199),
+)
+
+
+def detection_class_color_rgb(class_id, class_name=""):
+    """Return a stable, high-contrast RGB color for one model class."""
+    try:
+        color_index = int(class_id)
+    except (TypeError, ValueError):
+        encoded = str(class_name or "").encode("utf-8")
+        color_index = sum((index + 1) * value for index, value in enumerate(encoded))
+    return DETECTION_CLASS_COLORS_RGB[color_index % len(DETECTION_CLASS_COLORS_RGB)]
 
 
 def apply_frame_transform(frame, transform_mode):
@@ -109,6 +144,75 @@ def transform_points_to_display(points, transform_mode, frame_width, frame_heigh
         pts[:, 0] = frame_width - 1 - pts[:, 0]
         pts[:, 1] = frame_height - 1 - pts[:, 1]
     return pts
+
+
+def _detection_polygon(detection):
+    points = detection.get("points")
+    if points is not None:
+        polygon = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if len(polygon) >= 3:
+            return cv2.convexHull(polygon).reshape(-1, 2)
+    x1, y1, x2, y2 = map(float, detection.get("bbox", (0, 0, 0, 0)))
+    return np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)), dtype=np.float32)
+
+
+def detection_overlap_metrics(first, second):
+    """Return polygon IoU and intersection/min-area containment for two detections."""
+    try:
+        first_polygon = _detection_polygon(first)
+        second_polygon = _detection_polygon(second)
+        first_area = abs(float(cv2.contourArea(first_polygon)))
+        second_area = abs(float(cv2.contourArea(second_polygon)))
+        if first_area <= 1e-6 or second_area <= 1e-6:
+            return 0.0, 0.0
+        intersection, _ = cv2.intersectConvexConvex(first_polygon, second_polygon)
+        intersection = max(0.0, float(intersection))
+        union = first_area + second_area - intersection
+        iou = intersection / union if union > 1e-6 else 0.0
+        containment = intersection / min(first_area, second_area)
+        return iou, containment
+    except (TypeError, ValueError, cv2.error):
+        return 0.0, 0.0
+
+
+def filter_overlapping_detections(detections, same_class=False, cross_class=False,
+                                  iou_threshold=0.45, containment_threshold=0.8):
+    """Suppress lower-confidence overlapping boxes only for explicitly enabled modes."""
+    if not same_class and not cross_class:
+        return detections
+
+    ranked = sorted(
+        enumerate(detections),
+        key=lambda item: (-float(item[1].get("confidence", 0.0)), item[0]),
+    )
+    kept = []
+    for original_index, candidate in ranked:
+        candidate_class = candidate.get("class")
+        should_suppress = False
+        for _, existing in kept:
+            classes_match = candidate_class == existing.get("class")
+            mode_enabled = same_class if classes_match else cross_class
+            if not mode_enabled:
+                continue
+            iou, containment = detection_overlap_metrics(candidate, existing)
+            if iou >= float(iou_threshold) or containment >= float(containment_threshold):
+                should_suppress = True
+                break
+        if not should_suppress:
+            kept.append((original_index, candidate))
+    return [detection for _, detection in sorted(kept, key=lambda item: item[0])]
+
+
+def _aligned_polygon_points(current_points, previous_points):
+    """Align cyclic/reversed OBB vertex order before temporal averaging."""
+    current = np.asarray(current_points, dtype=np.float32).reshape(-1, 2)
+    previous = np.asarray(previous_points, dtype=np.float32).reshape(-1, 2)
+    if current.shape != previous.shape or len(current) < 3:
+        return current
+    candidates = []
+    for source in (current, current[::-1]):
+        candidates.extend(np.roll(source, offset, axis=0) for offset in range(len(source)))
+    return min(candidates, key=lambda candidate: float(np.mean(np.linalg.norm(candidate - previous, axis=1))))
 
 
 def get_safe_torch_device():
@@ -172,6 +276,7 @@ class VisionThread(QThread):
     # 信号传递参数：画面, 步骤列表, 当前索引, 暂停标识, 进度, 警报文字, 完成的轮数, 当前子次数
     update_ui_signal = Signal(np.ndarray, list, int, bool, int, str, int, int)
     recording_time_signal = Signal(str)
+    alarm_clip_saved_signal = Signal(str)
     aoi_update_signal = Signal(float, str, bool)  # similarity, state, is_blocked
     aoi_capture_done_signal = Signal(np.ndarray, np.ndarray, tuple)  # feature_vector, crop_image, (frame_w, frame_h, crop_w, crop_h)
     aoi_capture_failed_signal = Signal(str)
@@ -185,7 +290,25 @@ class VisionThread(QThread):
         self.final_step_engine = ProcessLogicEngine()
         self.logic_engine = ProcessLogicEngine()
         self.intent_engine = IntentEngine()
+        self.derived_obb_tracker = ObbInternalOrderTracker()
+        self.toggle_state_monitor = ToggleStateMonitorEngine()
+        self.slot_monitor = AnchorSlotMonitorEngine()
+        self.result_sequence_monitor = ResultSequenceMonitorEngine()
+        self.step_wiring_monitor = AnchorSlotMonitorEngine()
+        self.step_wiring_configs = {}
+        self.active_step_wiring_idx = None
+        self.step_wiring_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
+        self.toggle_state_statuses = []
+        self.slot_monitor_statuses = []
+        self.result_sequence_statuses = []
+        self.slot_expectation_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
+        self.monitor_event_log = []
         self.workflow_monitor = WorkflowMonitor(self.engine)  # 🌟 挂载全局监控器
+        self.show_jump_progress = process_editor.DEFAULT_JUMP_PROGRESS_VISIBLE
         self.ng_tracker = NGProductTracker()  # 🌟 NG 产品追踪器
         self.remediation_engines = {}  # 跳步补救引擎: step_idx -> ProcessLogicEngine
         self.remediation_mode = False
@@ -203,10 +326,18 @@ class VisionThread(QThread):
         self.step_cooldown_until_by_idx = {}
         self.step_cooldown_status_by_idx = {}
         self.step_prereq_status_by_idx = {}
+        self.step_result_status_by_idx = {}
+        self.step_result_hit_counts = {}
+        self.step_post_action_latched = set()
+        self.post_completion_check = None
         self.unordered_completion_order = {}
         self.unordered_completion_seq = 0
         self.unordered_active_idx = None
         self.wrong_pair_counters = {}
+        self.pending_group_final_checks = []
+        self.group_final_alert_message = ""
+        self.group_final_alert_frames = 0
+        self.group_final_alert_key = ""
 
         # AOI 特征比对状态机
         self.aoi_extractor = None
@@ -235,6 +366,14 @@ class VisionThread(QThread):
         self.name_to_id_cache = {}  # 反向映射：{eng_name: id}
         self.process_steps = []
         self.forbidden_targets = []
+        self.state_alarm_rules = []
+        self.state_alarm_confirm_frames = process_editor.DEFAULT_STATE_ALARM_CONFIRM_FRAMES
+        self.state_alarm_release_frames = process_editor.DEFAULT_STATE_ALARM_RELEASE_FRAMES
+        self.state_alarm_padding_ratio = process_editor.DEFAULT_STATE_ALARM_PADDING_RATIO
+        self.state_alarm_hit_counts = {}
+        self.state_alarm_active_idx = None
+        self.state_alarm_clear_frames = 0
+        self.state_alarm_message = ""
         self.current_step_idx = 0
         self.current_sub_count = 0
         self.completed_cycles = 0
@@ -245,7 +384,14 @@ class VisionThread(QThread):
         self.final_pause_start_time = 0  # 冷却计时器
         self.final_last_action_time = 0  # 上一次拧螺丝的时间（用于防误触清零）
         self.step_timeout = process_editor.DEFAULT_STEP_TIMEOUT
-        self.current_conf = 0.80  # YOLO 置信度阈值 (动态可调)
+        self.current_conf = 0.25  # YOLO 置信度阈值 (动态可调)
+        # 检测框后处理默认全部关闭；关闭时不添加推理参数，也不修改模型原始结果。
+        self.same_class_box_filter_enabled = False
+        self.cross_class_box_filter_enabled = False
+        self.detection_filter_iou = 0.45
+        self.detection_filter_containment = 0.8
+        self.detection_smoothing_current_weight = 0.72
+        self._previous_stable_detections = []
         self.is_pausing = False
         self.pause_start_time = 0
         self.cycle_pausing = False
@@ -254,6 +400,8 @@ class VisionThread(QThread):
         # 🌟 性能优化：PIL 字体只加载一次，不每帧重复 IO
         self.font_label = None
         self.font_hand = None
+        self._text_patch_cache = {}
+        self._text_patch_cache_limit = 512
         self._init_fonts()
         # UI 通信的控制开关
         self.force_skip_signal = False
@@ -267,14 +415,36 @@ class VisionThread(QThread):
         self.total_paused_time = 0
         self.pause_start_tick = 0
         # 🌟 分辨率设置（默认值）
-        self.capture_width = 1280
-        self.capture_height = 720
-        self.yolo_imgsz = None  # None = 使用模型原生分辨率
+        self.capture_width = 1920
+        self.capture_height = 1080
+        self.yolo_imgsz = 1280
+        self.yolo_input_size = None  # 实际送入模型的 (width, height)
+        self._yolo_input_size_key = None
         self.record_width = 1920
         self.record_height = 1080
+        # 报警追溯录像：常驻保存最近 5 秒的低内存 JPEG 环形缓冲区，
+        # 报警触发后再继续写 5 秒，并把当时工序上下文写进画面和 JSON。
+        self.alarm_clip_enabled = True
+        self.alarm_clip_pre_seconds = 5.0
+        self.alarm_clip_post_seconds = 5.0
+        self.alarm_clip_target_fps = 15.0
+        self.alarm_clip_width = 1280
+        self.alarm_clip_height = 720
+        self.alarm_clip_root = os.path.join(base_path, "alarm-recordings")
+        self._alarm_frame_buffer = deque()
+        self._alarm_clip_writer = None
+        self._alarm_clip_event = None
+        self._alarm_clip_end_time = 0.0
+        self._alarm_clip_last_written_ts = 0.0
+        self._alarm_last_present_key = ""
+        self._alarm_key_last_triggered = {}
+        self._alarm_context_signature = None
+        self._alarm_clip_product_ref = None
+        self._alarm_last_buffered_ts = 0.0
         self.frame_transform = "none"
         self.alarm_light = AlarmLightController()
         self._alarm_forbidden_active = False
+        self._alarm_forbidden_buzzer = True
         self._alarm_aoi_blocked_active = False
 
     def _safe_stop_pipeline(self, pipeline):
@@ -290,6 +460,110 @@ class VisionThread(QThread):
                 cap.release()
             except Exception as e:
                 print(f"[Camera] release ignored: {e}")
+
+    def _update_yolo_input_size(self, native_frame):
+        """Cache the actual preprocessed tensor size used by Ultralytics."""
+        if native_frame is None or self.model is None:
+            self.yolo_input_size = None
+            self._yolo_input_size_key = None
+            return None
+        frame_h, frame_w = native_frame.shape[:2]
+        predictor = getattr(self.model, "predictor", None)
+        key = (
+            int(frame_w),
+            int(frame_h),
+            int(self.yolo_imgsz) if self.yolo_imgsz is not None else None,
+            id(predictor),
+        )
+        if self._yolo_input_size_key == key and self.yolo_input_size:
+            return self.yolo_input_size
+        try:
+            transformed = predictor.pre_transform([native_frame])[0]
+            input_h, input_w = transformed.shape[:2]
+            self.yolo_input_size = (int(input_w), int(input_h))
+        except Exception:
+            fallback = int(self.yolo_imgsz or 640)
+            self.yolo_input_size = (fallback, fallback)
+        self._yolo_input_size_key = key
+        return self.yolo_input_size
+
+    def _build_infer_kwargs(self, active_class_ids):
+        kwargs = {
+            "classes": active_class_ids,
+            "verbose": False,
+            "conf": self.current_conf,
+            "device": self.infer_device,
+        }
+        if self.yolo_imgsz is not None:
+            kwargs["imgsz"] = self.yolo_imgsz
+        if self.same_class_box_filter_enabled or self.cross_class_box_filter_enabled:
+            kwargs["iou"] = self.detection_filter_iou
+        if self.cross_class_box_filter_enabled:
+            kwargs["agnostic_nms"] = True
+        return kwargs
+
+    def reset_detection_postprocessing(self):
+        self._previous_stable_detections = []
+
+    def _stabilize_detection_positions(self, detections):
+        if not self.same_class_box_filter_enabled:
+            self.reset_detection_postprocessing()
+            return detections
+
+        used_previous = set()
+        stabilized = []
+        current_weight = float(self.detection_smoothing_current_weight)
+        previous_weight = 1.0 - current_weight
+        for detection in detections:
+            best_index = None
+            best_score = 0.0
+            for index, previous in enumerate(self._previous_stable_detections):
+                if index in used_previous or previous.get("class") != detection.get("class"):
+                    continue
+                iou, containment = detection_overlap_metrics(detection, previous)
+                score = max(iou, containment * 0.6)
+                if score > best_score:
+                    best_index = index
+                    best_score = score
+
+            current = dict(detection)
+            if best_index is not None and best_score >= 0.2:
+                previous = self._previous_stable_detections[best_index]
+                used_previous.add(best_index)
+                if detection.get("points") is not None and previous.get("points") is not None:
+                    previous_points = np.asarray(previous["points"], dtype=np.float32).reshape(-1, 2)
+                    current_points = _aligned_polygon_points(detection["points"], previous_points)
+                    if current_points.shape == previous_points.shape:
+                        smoothed_points = current_weight * current_points + previous_weight * previous_points
+                        current["points"] = smoothed_points.tolist()
+                        current["bbox"] = [
+                            float(np.min(smoothed_points[:, 0])),
+                            float(np.min(smoothed_points[:, 1])),
+                            float(np.max(smoothed_points[:, 0])),
+                            float(np.max(smoothed_points[:, 1])),
+                        ]
+                else:
+                    current_bbox = np.asarray(detection.get("bbox", ()), dtype=np.float32)
+                    previous_bbox = np.asarray(previous.get("bbox", ()), dtype=np.float32)
+                    if current_bbox.shape == (4,) and previous_bbox.shape == (4,):
+                        current["bbox"] = (
+                            current_weight * current_bbox + previous_weight * previous_bbox
+                        ).tolist()
+            stabilized.append(current)
+
+        self._previous_stable_detections = [dict(item) for item in stabilized]
+        return stabilized
+
+    def _postprocess_model_detections(self, detections):
+        filtered = filter_overlapping_detections(
+            detections,
+            same_class=self.same_class_box_filter_enabled,
+            cross_class=self.cross_class_box_filter_enabled,
+            iou_threshold=self.detection_filter_iou,
+            containment_threshold=self.detection_filter_containment,
+        )
+        return self._stabilize_detection_positions(filtered)
+
     def _init_fonts(self):
         """预加载字体，避免每帧重复 IO。优先用打包/同目录字体，再回退系统字体"""
         # 优先同目录/打包路径
@@ -320,6 +594,70 @@ class VisionThread(QThread):
                 except IOError:
                     continue
 
+    def _get_text_patch(self, text, rgb_color, font=None, background=None):
+        """Render and cache a small Unicode text patch instead of converting a full frame to PIL."""
+        font = font or self.font_label
+        rgb_color = tuple(int(channel) for channel in rgb_color)
+        background_key = None if background is None else tuple(int(channel) for channel in background)
+        cache_key = (str(text), rgb_color, id(font), background_key)
+        cached = self._text_patch_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            left, top, right, bottom = font.getbbox(str(text))
+        except AttributeError:
+            width, height = font.getsize(str(text))
+            left, top, right, bottom = 0, 0, width, height
+        stroke_width = 1 if background is None else 0
+        padding = max(2, stroke_width + 1)
+        width = max(1, int(right - left + padding * 2))
+        height = max(1, int(bottom - top + padding * 2))
+        if background is None:
+            pil_patch = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        else:
+            pil_patch = Image.new("RGBA", (width, height), (*background_key, 255))
+        draw = ImageDraw.Draw(pil_patch)
+        draw.text(
+            (padding - left, padding - top), str(text), font=font,
+            fill=(*rgb_color, 255),
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0, 255),
+        )
+        rgba = np.asarray(pil_patch)
+        bgr = np.ascontiguousarray(rgba[:, :, :3][:, :, ::-1])
+        alpha = None if background is not None else np.ascontiguousarray(rgba[:, :, 3])
+        patch = (bgr, alpha)
+        if len(self._text_patch_cache) >= self._text_patch_cache_limit:
+            self._text_patch_cache.clear()
+        self._text_patch_cache[cache_key] = patch
+        return patch
+
+    @staticmethod
+    def _paste_text_patch(frame, patch, x, y):
+        """Paste a cached BGR/alpha text patch into a frame with boundary clipping."""
+        patch_bgr, alpha = patch
+        frame_h, frame_w = frame.shape[:2]
+        patch_h, patch_w = patch_bgr.shape[:2]
+        x, y = int(x), int(y)
+        dst_x1, dst_y1 = max(0, x), max(0, y)
+        dst_x2, dst_y2 = min(frame_w, x + patch_w), min(frame_h, y + patch_h)
+        if dst_x1 >= dst_x2 or dst_y1 >= dst_y2:
+            return
+        src_x1, src_y1 = dst_x1 - x, dst_y1 - y
+        src_x2 = src_x1 + (dst_x2 - dst_x1)
+        src_y2 = src_y1 + (dst_y2 - dst_y1)
+        source = patch_bgr[src_y1:src_y2, src_x1:src_x2]
+        target = frame[dst_y1:dst_y2, dst_x1:dst_x2]
+        if alpha is None:
+            target[:] = source
+            return
+        mask = alpha[src_y1:src_y2, src_x1:src_x2, None].astype(np.uint16)
+        target[:] = (
+            (source.astype(np.uint16) * mask
+             + target.astype(np.uint16) * (255 - mask) + 127) // 255
+        ).astype(np.uint8)
+
     def _reset_aoi_runtime(self):
         self.aoi_state = None
         self.aoi_step_idx = None
@@ -349,7 +687,11 @@ class VisionThread(QThread):
         self._set_forbidden_alarm(False)
         self._alarm_aoi_blocked_active = False
 
-    def _reset_workflow_runtime(self):
+    def _reset_workflow_runtime(
+        self,
+        clear_group_final_checks=True,
+        preserve_jump_alarm=False,
+    ):
         self.current_step_idx = 0
         self.current_sub_count = 0
         self.final_sub_count = 0
@@ -361,7 +703,12 @@ class VisionThread(QThread):
         self.cycle_pausing = False
         self.engine.reset()
         self.final_step_engine.reset()
+        self.derived_obb_tracker.reset()
         self.remediation_engines.clear()
+        self.state_alarm_hit_counts.clear()
+        self.state_alarm_active_idx = None
+        self.state_alarm_clear_frames = 0
+        self.state_alarm_message = ""
         self.remediation_mode = False
         self.remediation_step_idx = None
         self.remediation_resume_idx = 0
@@ -374,29 +721,54 @@ class VisionThread(QThread):
         self.step_cooldown_until_by_idx.clear()
         self.step_cooldown_status_by_idx.clear()
         self.step_prereq_status_by_idx.clear()
+        self.step_result_status_by_idx.clear()
+        self.step_result_hit_counts.clear()
+        self.step_post_action_latched.clear()
+        self.post_completion_check = None
+        self.step_wiring_monitor.configure([])
+        self.active_step_wiring_idx = None
+        self.step_wiring_status = {
+            "configured": False, "satisfied": True, "settled": True,
+            "mismatches": [], "progress": 100,
+        }
         self.unordered_completion_order.clear()
         self.unordered_completion_seq = 0
         self.unordered_active_idx = None
         self.wrong_pair_counters.clear()
-        self._reset_jump_monitors(clear_restart_guard=True)
+        if clear_group_final_checks:
+            self.pending_group_final_checks.clear()
+            self.group_final_alert_message = ""
+            self.group_final_alert_frames = 0
+            self.group_final_alert_key = ""
+        self._reset_jump_monitors(
+            clear_restart_guard=True,
+            preserve_alarm=preserve_jump_alarm,
+        )
         if hasattr(self.intent_engine, "reset_runtime_state"):
             self.intent_engine.reset_runtime_state()
         self._reset_aoi_runtime()
         self._alarm_aoi_blocked_active = False
         self.step_start_time = time.time()
 
-    def _set_forbidden_alarm(self, active):
+    def _set_forbidden_alarm(self, active, buzzer=True):
         active = bool(active)
-        if self._alarm_forbidden_active == active:
+        buzzer = bool(buzzer)
+        if (self._alarm_forbidden_active == active
+                and (not active or self._alarm_forbidden_buzzer == buzzer)):
             return
         self._alarm_forbidden_active = active
-        self.alarm_light.set_forbidden_alarm(active)
+        self._alarm_forbidden_buzzer = buzzer
+        self.alarm_light.set_forbidden_alarm(active, buzzer=buzzer)
 
     def _flash_red_alarm(self, key, buzzer=True):
         self.alarm_light.flash_red(key=key, times=3, interval=0.3, buzzer=buzzer)
 
     def prepare_for_new_stream(self, interrupted_reason='切换视频源时产品未完成'):
         """开启新相机/视频前清理旧运行态，避免上一轮按钮指令串到下一轮。"""
+        self._finish_alarm_clip("stream_changed")
+        self._alarm_frame_buffer.clear()
+        self._alarm_last_present_key = ""
+        self._alarm_last_buffered_ts = 0.0
         if self.ng_tracker.current_product:
             if self.ng_tracker.has_product_activity(min_elapsed_sec=5):
                 self.ng_tracker.finalize_as_ng(interrupted_reason)
@@ -404,6 +776,16 @@ class VisionThread(QThread):
                 self.ng_tracker.current_product = None
         self._reset_transient_requests()
         self._reset_workflow_runtime()
+        self.slot_monitor.reset()
+        self.result_sequence_monitor.reset()
+        self.slot_monitor_statuses = []
+        self.result_sequence_statuses = []
+        self.slot_expectation_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
+        self.yolo_input_size = None
+        self._yolo_input_size_key = None
+        self.reset_detection_postprocessing()
 
     def _finish_recording(self):
         if self.video_writer:
@@ -417,11 +799,364 @@ class VisionThread(QThread):
         self.total_paused_time = 0
         self.pause_start_tick = 0
 
+    @staticmethod
+    def _safe_record_path_part(value, fallback="未命名"):
+        text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "").strip())
+        text = text.strip(" ._")
+        return (text or fallback)[:80]
+
+    @staticmethod
+    def _recordable_alarm_key(message):
+        """Return an event key only for real alarms, not ordinary guidance text."""
+        text = re.sub(r"\s+", " ", str(message or "")).strip()
+        if not text or text.startswith(("🔎", "✅", "🧪")):
+            return ""
+        alarm_terms = (
+            "报警", "预警", "违禁", "跳步", "错误", "失败", "异常", "超时",
+            "耗时过长", "强制跳过", "作废", "无法", "中断", "禁止", "不通过",
+            "阻塞", "强制放行", "状态违规",
+            "布局错误", "接线顺序错误", "接线结果错误", "错误装配",
+        )
+        if text.startswith(("⚠", "❌", "🚫")) or any(term in text for term in alarm_terms):
+            # 进度、相似度等会改变的数字不应把同一次报警拆成多个录像事件。
+            return re.sub(r"\d+(?:\.\d+)?%?", "#", text)[:180]
+        return ""
+
+    def _build_alarm_record_context(self, alert_message, progress):
+        cp = self.ng_tracker.current_product or {}
+        post_check = dict(self.post_completion_check or {})
+        step_idx = int(post_check.get("step_idx", self.current_step_idx) or 0)
+        step_text = ""
+        if 0 <= step_idx < len(self.process_steps):
+            step_text = str(self.process_steps[step_idx].get("text", "") or "")
+        completed_steps = [
+            i + 1 for i, rec in enumerate(cp.get("step_records", []) or [])
+            if rec.get("status") in {"completed", "remedied"}
+        ]
+        step_statuses = [
+            {
+                "step": int(rec.get("step", index + 1) or index + 1),
+                "text": str(rec.get("text", "") or ""),
+                "status": str(rec.get("status", "pending") or "pending"),
+                "reason": str(rec.get("reason", "") or ""),
+            }
+            for index, rec in enumerate(cp.get("step_records", []) or [])
+        ]
+        jump_alarms = list(cp.get("jump_alarms", []) or [])
+        wiring = dict(self.step_wiring_status or {})
+        return {
+            "captured_at": datetime.now().isoformat(timespec="milliseconds"),
+            "profile": self.ng_tracker.active_profile,
+            "product_id": cp.get("id"),
+            "product_status": cp.get("status", "未跟踪"),
+            "step_index": step_idx,
+            "step_number": step_idx + 1 if self.process_steps else None,
+            "step_text": step_text,
+            "step_progress": 100 if post_check else max(0, min(100, int(progress or 0))),
+            "sub_count": int(self.current_sub_count or 0),
+            "completed_steps": completed_steps,
+            "step_statuses": step_statuses,
+            "latest_jump_alarm": dict(jump_alarms[-1]) if jump_alarms else {},
+            "alert_message": str(alert_message or ""),
+            "post_completion_check": {
+                "active": bool(post_check),
+                "name": post_check.get("name", ""),
+                "type": post_check.get("type", ""),
+                "progress": int(post_check.get("progress", 0) or 0),
+                "message": post_check.get("message", ""),
+            },
+            "wiring_check": {
+                "configured": bool(wiring.get("configured")),
+                "satisfied": bool(wiring.get("satisfied")),
+                "phase": wiring.get("phase", ""),
+                "expected_order": list(wiring.get("expected_order", []) or []),
+                "actual_order": list(
+                    wiring.get("actual_order", []) or wiring.get("visible_order", []) or []
+                ),
+                "mismatches": list(wiring.get("mismatches", []) or []),
+            },
+        }
+
+    def _render_alarm_context_frame(self, frame, context):
+        target_w, target_h = self.alarm_clip_width, self.alarm_clip_height
+        src_h, src_w = frame.shape[:2]
+        scale = min(target_w / max(1, src_w), target_h / max(1, src_h))
+        resized = cv2.resize(
+            frame, (max(1, int(src_w * scale)), max(1, int(src_h * scale)))
+        )
+        canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        y0 = (target_h - resized.shape[0]) // 2
+        x0 = (target_w - resized.shape[1]) // 2
+        canvas[y0:y0 + resized.shape[0], x0:x0 + resized.shape[1]] = resized
+
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (0, 0), (target_w, 150), (18, 18, 18), -1)
+        canvas = cv2.addWeighted(overlay, 0.82, canvas, 0.18, 0)
+        profile = str(context.get("profile") or "未选择方案")
+        product_id = context.get("product_id")
+        product_text = f"产品#{product_id}" if product_id is not None else "未跟踪产品"
+        step_number = context.get("step_number")
+        step_label = f"步骤{step_number}" if step_number is not None else "无普通工序"
+        step_text = str(context.get("step_text") or "")[:36]
+        alert = str(context.get("alert_message") or "无报警（报警前画面）")[:52]
+        post = context.get("post_completion_check", {}) or {}
+        stage = (
+            f"独立验收 {int(post.get('progress', 0) or 0)}%"
+            if post.get("active") else f"工序进度 {int(context.get('step_progress', 0) or 0)}%"
+        )
+        lines = (
+            (f"{context.get('captured_at', '')}  |  {profile}  |  {product_text}", (255, 255, 255)),
+            (f"{step_label}  {step_text}  |  {stage}  |  产品状态:{context.get('product_status', '')}", (180, 230, 255)),
+            (f"事件: {alert}", (255, 210, 80) if not context.get("alert_message") else (255, 110, 110)),
+        )
+        for line_idx, (text_value, color) in enumerate(lines):
+            patch = self._get_text_patch(text_value, color, font=self.font_hand)
+            self._paste_text_patch(canvas, patch, 16, 6 + line_idx * 47)
+        return canvas
+
+    @staticmethod
+    def _alarm_context_key(context):
+        post = context.get("post_completion_check", {}) or {}
+        wiring = context.get("wiring_check", {}) or {}
+        return (
+            context.get("product_id"), context.get("product_status"),
+            context.get("step_number"), context.get("step_progress"),
+            tuple(context.get("completed_steps", []) or []), context.get("alert_message"),
+            tuple(
+                (item.get("step"), item.get("status"), item.get("reason"))
+                for item in (context.get("step_statuses", []) or [])
+            ),
+            bool(post.get("active")), post.get("progress"), post.get("message"),
+            wiring.get("phase"), wiring.get("satisfied"),
+            tuple(wiring.get("actual_order", []) or []),
+        )
+
+    def _append_alarm_buffer(self, now, frame, context):
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return
+        self._alarm_frame_buffer.append((now, encoded.tobytes(), context))
+        cutoff = now - self.alarm_clip_pre_seconds
+        while self._alarm_frame_buffer and self._alarm_frame_buffer[0][0] < cutoff:
+            self._alarm_frame_buffer.popleft()
+
+    def _append_alarm_context_change(self, timestamp, context):
+        if not self._alarm_clip_event:
+            return
+        signature = self._alarm_context_key(context)
+        if signature == self._alarm_context_signature:
+            return
+        self._alarm_context_signature = signature
+        snapshot = dict(context)
+        snapshot["offset_seconds"] = round(
+            max(0.0, timestamp - self._alarm_clip_event["buffer_started_epoch"]), 3
+        )
+        self._alarm_clip_event["context_timeline"].append(snapshot)
+
+    def _start_alarm_clip(self, now, alarm_message, alarm_key, current_fps):
+        stamp = datetime.fromtimestamp(now)
+        profile_part = self._safe_record_path_part(self.ng_tracker.active_profile, "默认方案")
+        cp = self.ng_tracker.current_product
+        product_id = cp.get("id") if cp else None
+        product_part = f"product_{int(product_id):06d}" if product_id is not None else "untracked"
+        event_dir = os.path.join(
+            self.alarm_clip_root, stamp.strftime("%Y-%m-%d"), profile_part, product_part
+        )
+        os.makedirs(event_dir, exist_ok=True)
+        basename = f"alarm_{stamp.strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
+        video_path = os.path.abspath(os.path.join(event_dir, basename + ".mp4"))
+        metadata_path = os.path.abspath(os.path.join(event_dir, basename + ".json"))
+
+        buffer_span = (
+            self._alarm_frame_buffer[-1][0] - self._alarm_frame_buffer[0][0]
+            if len(self._alarm_frame_buffer) > 1 else 0.0
+        )
+        measured_fps = (
+            (len(self._alarm_frame_buffer) - 1) / buffer_span if buffer_span > 0.2
+            else float(current_fps or 15.0)
+        )
+        output_fps = max(5.0, min(30.0, measured_fps))
+        writer = cv2.VideoWriter(
+            video_path, cv2.VideoWriter_fourcc(*"mp4v"), output_fps,
+            (self.alarm_clip_width, self.alarm_clip_height),
+        )
+        if not writer.isOpened():
+            writer.release()
+            print(f"[AlarmRecording] 无法创建报警录像: {video_path}")
+            return False
+
+        buffer_start = self._alarm_frame_buffer[0][0] if self._alarm_frame_buffer else now
+        self._alarm_clip_writer = writer
+        self._alarm_clip_end_time = now + self.alarm_clip_post_seconds
+        self._alarm_clip_last_written_ts = 0.0
+        self._alarm_context_signature = None
+        self._alarm_clip_event = {
+            "schema_version": 1,
+            "event_type": "alarm_clip",
+            "started_at": stamp.isoformat(timespec="milliseconds"),
+            "triggered_at": stamp.isoformat(timespec="milliseconds"),
+            "ended_at": "",
+            "pre_seconds": self.alarm_clip_pre_seconds,
+            "post_seconds": self.alarm_clip_post_seconds,
+            "fps": round(output_fps, 3),
+            "resolution": [self.alarm_clip_width, self.alarm_clip_height],
+            "video_path": video_path,
+            "metadata_path": metadata_path,
+            "buffer_started_epoch": buffer_start,
+            "profile": self.ng_tracker.active_profile,
+            "product_id": product_id,
+            "triggers": [{
+                "time": stamp.isoformat(timespec="milliseconds"),
+                "message": str(alarm_message or ""),
+                "key": alarm_key,
+            }],
+            "context_timeline": [],
+        }
+        for frame_ts, encoded, buffered_context in self._alarm_frame_buffer:
+            decoded = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is not None:
+                writer.write(decoded)
+                self._alarm_clip_last_written_ts = frame_ts
+                self._append_alarm_context_change(frame_ts, buffered_context)
+
+        self._alarm_clip_product_ref = None
+        if cp is not None:
+            product_entry = {
+                "triggered_at": stamp.isoformat(timespec="milliseconds"),
+                "alarm_message": str(alarm_message or ""),
+                "video_path": video_path,
+                "metadata_path": metadata_path,
+                "status": "recording",
+            }
+            cp.setdefault("alarm_clips", []).append(product_entry)
+            self._alarm_clip_product_ref = product_entry
+        return True
+
+    def _finish_alarm_clip(self, reason="post_window_complete"):
+        if self._alarm_clip_writer is not None:
+            self._alarm_clip_writer.release()
+            self._alarm_clip_writer = None
+        event = self._alarm_clip_event
+        if not event:
+            return
+        event["ended_at"] = datetime.now().isoformat(timespec="milliseconds")
+        event["finish_reason"] = reason
+        event["duration_seconds"] = round(
+            max(0.0, self._alarm_clip_last_written_ts - event.get("buffer_started_epoch", 0.0)), 3
+        )
+        event.pop("buffer_started_epoch", None)
+        metadata_path = event["metadata_path"]
+        temp_path = metadata_path + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as file:
+                json.dump(event, file, ensure_ascii=False, indent=2)
+            os.replace(temp_path, metadata_path)
+            if self._alarm_clip_product_ref is not None:
+                self._alarm_clip_product_ref.update({
+                    "status": "saved",
+                    "ended_at": event["ended_at"],
+                    "duration_seconds": event["duration_seconds"],
+                })
+            self.alarm_clip_saved_signal.emit(event["video_path"])
+            print(f"[AlarmRecording] 已保存: {event['video_path']}")
+        except Exception as exc:
+            print(f"[AlarmRecording] 保存元数据失败: {exc}")
+        self._alarm_clip_event = None
+        self._alarm_clip_end_time = 0.0
+        self._alarm_clip_last_written_ts = 0.0
+        self._alarm_context_signature = None
+        self._alarm_clip_product_ref = None
+
+    def _update_alarm_clip(self, now, annotated_frame, context, alert_message, current_fps):
+        if not self.alarm_clip_enabled:
+            if self._alarm_clip_event:
+                self._finish_alarm_clip("disabled")
+            self._alarm_frame_buffer.clear()
+            self._alarm_last_present_key = ""
+            self._alarm_last_buffered_ts = 0.0
+            return
+
+        alarm_key = self._recordable_alarm_key(alert_message)
+        new_trigger = bool(alarm_key and alarm_key != self._alarm_last_present_key)
+        if alarm_key:
+            self._alarm_last_present_key = alarm_key
+        else:
+            self._alarm_last_present_key = ""
+
+        # 追溯录像固定抽样到约 15 FPS，避免 4K/高帧率相机为了环形缓冲
+        # 每帧都做 JPEG 编码，仍能完整覆盖按时间计算的前后 5 秒。
+        sample_interval = 1.0 / max(1.0, float(self.alarm_clip_target_fps or 15.0))
+        should_capture = bool(
+            new_trigger
+            or self._alarm_last_buffered_ts <= 0
+            or now - self._alarm_last_buffered_ts >= sample_interval * 0.95
+        )
+        if not should_capture:
+            if self._alarm_clip_event and now >= self._alarm_clip_end_time:
+                self._finish_alarm_clip()
+            return
+        record_frame = self._render_alarm_context_frame(annotated_frame, context)
+        self._append_alarm_buffer(now, record_frame, context)
+        self._alarm_last_buffered_ts = now
+
+        last_trigger = float(self._alarm_key_last_triggered.get(alarm_key, 0.0) or 0.0)
+        if new_trigger and now - last_trigger >= 2.0:
+            self._alarm_key_last_triggered[alarm_key] = now
+            if len(self._alarm_key_last_triggered) > 128:
+                oldest = sorted(self._alarm_key_last_triggered, key=self._alarm_key_last_triggered.get)[:32]
+                for key in oldest:
+                    self._alarm_key_last_triggered.pop(key, None)
+            if self._alarm_clip_event:
+                self._alarm_clip_event["triggers"].append({
+                    "time": datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
+                    "message": str(alert_message or ""),
+                    "key": alarm_key,
+                })
+                self._alarm_clip_end_time = max(
+                    self._alarm_clip_end_time, now + self.alarm_clip_post_seconds
+                )
+            else:
+                self._start_alarm_clip(now, alert_message, alarm_key, current_fps)
+
+        if self._alarm_clip_writer is not None and now > self._alarm_clip_last_written_ts:
+            self._alarm_clip_writer.write(record_frame)
+            self._alarm_clip_last_written_ts = now
+            self._append_alarm_context_change(now, context)
+        if self._alarm_clip_event and now >= self._alarm_clip_end_time:
+            self._finish_alarm_clip()
+
     def load_config(self, config_data):
         mapping = config_data.get("mapping", {})
+        relation_config = normalize_derived_obb_relation(
+            config_data.get("derived_obb_relation")
+        )
+        mapping_lookup = {}
+        for info in mapping.values():
+            eng_name = str(info.get("eng_name", "") or "").strip()
+            zh_name = str(info.get("zh_name", "") or "").strip()
+            if eng_name:
+                mapping_lookup[eng_name.lower()] = eng_name
+            if zh_name and eng_name:
+                mapping_lookup[zh_name.lower()] = eng_name
+        for key in ("anchor_class", "first_class", "second_class"):
+            configured_name = relation_config.get(key, "")
+            resolved_name = mapping_lookup.get(str(configured_name).lower())
+            if resolved_name:
+                relation_config[key] = resolved_name
+        runtime_mapping = dict(mapping)
+        runtime_mapping.update(derived_obb_virtual_mapping(relation_config))
+
         old_steps = self.process_steps
         self.process_steps = config_data.get("process_steps", [])
+        self.step_wiring_configs = {
+            index: normalize_step_wiring_check(step.get("step_wiring_check", {}), index)
+            for index, step in enumerate(self.process_steps)
+            if isinstance(step, dict)
+        }
         self.step_timeout = config_data.get("step_timeout", process_editor.DEFAULT_STEP_TIMEOUT)
+        self.show_jump_progress = bool(config_data.get(
+            "jump_progress_visible", process_editor.DEFAULT_JUMP_PROGRESS_VISIBLE
+        ))
         self.workflow_monitor.configure(
             monitor_scope=config_data.get("jump_monitor_scope", process_editor.DEFAULT_JUMP_MONITOR_SCOPE),
             strong_action_enabled=config_data.get(
@@ -438,23 +1173,59 @@ class VisionThread(QThread):
         # 缓存类名映射，避免每帧访问 self.model.names（ONNX 模型会触发 CUDA 设备检测导致崩溃）
         self.model_names = {}
         for class_id_str, info in mapping.items():
-            self.model_names[int(class_id_str)] = info.get("eng_name", "")
+            try:
+                class_id = int(class_id_str)
+            except (TypeError, ValueError):
+                continue
+            self.model_names[class_id] = info.get("eng_name", "")
         self.name_to_id_cache = {v: k for k, v in self.model_names.items() if v}
+        self.derived_obb_tracker.configure(relation_config)
 
-        self.engine.build_parser(mapping)
+        self.engine.build_parser(runtime_mapping)
         self.engine.reset()
+        self.toggle_state_monitor.configure(
+            config_data.get("toggle_state_monitors", ""),
+            config_data.get("state_conditional_rules", ""),
+        )
+        self.slot_monitor.configure(config_data.get("slot_monitors", ""))
+        self.result_sequence_monitor.configure(
+            config_data.get("result_monitor_stages", [])
+        )
+        self.step_wiring_monitor.configure([])
+        self.active_step_wiring_idx = None
+        self.toggle_state_statuses = []
+        self.slot_monitor_statuses = []
+        self.result_sequence_statuses = []
+        self.slot_expectation_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
+        self.step_wiring_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
+        self.monitor_event_log = []
         # 👇 新增：同步给末步引擎
-        self.final_step_engine.build_parser(mapping)
+        self.final_step_engine.build_parser(runtime_mapping)
         self.final_step_engine.reset()
         # 同步所有补救引擎的字典映射（引擎实例按需创建）
         for eng in self.remediation_engines.values():
-            eng.build_parser(mapping)
+            eng.build_parser(runtime_mapping)
         self.remediation_engines.clear()
         self.unordered_step_engines.clear()
         self.step_action_status_by_idx.clear()
         self.step_cooldown_until_by_idx.clear()
         self.step_cooldown_status_by_idx.clear()
         self.step_prereq_status_by_idx.clear()
+        self.step_result_status_by_idx.clear()
+        self.step_result_hit_counts.clear()
+        self.step_post_action_latched.clear()
+        self.step_wiring_monitor.configure([])
+        self.active_step_wiring_idx = None
+        self.step_wiring_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
+        self.step_result_status_by_idx.clear()
+        self.step_result_hit_counts.clear()
+        self.step_post_action_latched.clear()
 
         # AOI 特征提取器懒加载：有任一工序启用 AOI 时才初始化
         has_aoi = any(s.get('aoi_feature_check', {}).get('enabled') for s in self.process_steps)
@@ -467,20 +1238,53 @@ class VisionThread(QThread):
                 print(f"[AOI] 特征提取器初始化失败: {e}")
         forbidden_str = config_data.get("forbidden_items", "")
         self.forbidden_targets = self.engine.parse_step_text(forbidden_str)
+        self.state_alarm_rules = self._parse_state_alarm_rules(
+            config_data.get("state_alarm_rules", "")
+        )
+        try:
+            self.state_alarm_confirm_frames = max(1, int(config_data.get(
+                "state_alarm_confirm_frames", process_editor.DEFAULT_STATE_ALARM_CONFIRM_FRAMES
+            )))
+        except (TypeError, ValueError):
+            self.state_alarm_confirm_frames = process_editor.DEFAULT_STATE_ALARM_CONFIRM_FRAMES
+        try:
+            self.state_alarm_release_frames = max(1, int(config_data.get(
+                "state_alarm_release_frames", process_editor.DEFAULT_STATE_ALARM_RELEASE_FRAMES
+            )))
+        except (TypeError, ValueError):
+            self.state_alarm_release_frames = process_editor.DEFAULT_STATE_ALARM_RELEASE_FRAMES
+        try:
+            self.state_alarm_padding_ratio = max(0.0, float(config_data.get(
+                "state_alarm_padding_ratio", process_editor.DEFAULT_STATE_ALARM_PADDING_RATIO
+            )))
+        except (TypeError, ValueError):
+            self.state_alarm_padding_ratio = process_editor.DEFAULT_STATE_ALARM_PADDING_RATIO
+        self.state_alarm_hit_counts.clear()
+        self.state_alarm_active_idx = None
+        self.state_alarm_clear_frames = 0
+        self.state_alarm_message = ""
         # 切换配置只清掉进行中的产品；真正开始计件放到视频流启动后处理
         if old_steps != self.process_steps:
             self.ng_tracker.current_product = None
         self._reset_workflow_runtime()
 
-    def _finish_and_restart_cycle(self):
+    def _finish_and_restart_cycle(self, preserve_jump_alarm=False):
         """正常完成当前产品并自动开始下一个产品循环"""
         if self.ng_tracker.current_product:
             self.ng_tracker._finalize_product()
         if self.process_steps:
             self.ng_tracker.start_product(self.process_steps)
-        self._reset_workflow_runtime()
+        self._reset_workflow_runtime(
+            clear_group_final_checks=False,
+            preserve_jump_alarm=preserve_jump_alarm,
+        )
+        self.slot_monitor.reset(preserve_calibration=True)
+        self.slot_monitor_statuses = []
+        self.slot_expectation_status = {
+            "configured": False, "satisfied": True, "settled": True, "mismatches": []
+        }
         self.just_restarted_cycle = True
-        self._activate_restart_guard()
+        self._activate_restart_guard(preserve_alarm=preserve_jump_alarm)
 
     def _step_order_group(self, step_dict):
         return str(step_dict.get("order_group", "")).strip()
@@ -520,9 +1324,27 @@ class VisionThread(QThread):
         except (TypeError, ValueError):
             return -1
 
+    def _detach_missing_enabled(self, step_dict):
+        value = step_dict.get("detach_missing_enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _detach_missing_frames(self, step_dict):
+        try:
+            return max(1, int(step_dict.get("detach_missing_frames", 30)))
+        except (TypeError, ValueError):
+            return 30
+
+    def _detach_missing_padding(self, step_dict):
+        try:
+            return max(0.0, float(step_dict.get("detach_missing_padding_ratio", 0.15)))
+        except (TypeError, ValueError):
+            return 0.15
+
     def _requires_hand_release(self, step_dict):
         return (
-            step_dict.get("action_type", "spatial") == "spatial"
+            step_dict.get("action_type", "spatial") in ("spatial", "hand_touch")
             and bool(step_dict.get("require_hand_release", False))
         )
 
@@ -634,11 +1456,318 @@ class VisionThread(QThread):
                 )
         return False, "", -1
 
+    def _group_final_check_config(self, group_indices):
+        for idx in group_indices or []:
+            if not (0 <= idx < len(self.process_steps)):
+                continue
+            config = self.process_steps[idx].get("group_final_check")
+            if isinstance(config, dict) and bool(config.get("enabled", False)):
+                return config
+        return None
+
+    def _target_boxes_for_group_final(self, detections, targets, padding_ratio=0.0):
+        boxes = []
+        for detection in detections or []:
+            bbox = detection.get("bbox")
+            class_name = detection.get("class", "")
+            if not bbox:
+                continue
+            if any(self.engine.target_matches(class_name, target) for target in (targets or [])):
+                boxes.append(self.engine.expand_bbox(bbox, padding_ratio))
+        return boxes
+
+    def _schedule_group_final_check(self, group_indices, detections=None):
+        """Start a non-blocking final-state audit after every member of an unordered group finishes."""
+        config = self._group_final_check_config(group_indices)
+        if not config:
+            return False
+
+        anchor_text = str(config.get("anchor", "") or "").strip()
+        expected_text = str(config.get("expected", "") or "").strip()
+        wrong_text = str(config.get("wrong", "") or "").strip()
+        anchor_targets = self.engine.parse_step_text(anchor_text)
+        expected_targets = self.engine.parse_step_text(expected_text)
+        wrong_targets = self.engine.parse_step_text(wrong_text)
+        if not anchor_targets or not expected_targets or not wrong_targets:
+            return False
+
+        try:
+            confirm_frames = max(1, int(config.get(
+                "confirm_frames", process_editor.DEFAULT_GROUP_FINAL_CONFIRM_FRAMES
+            )))
+        except (TypeError, ValueError):
+            confirm_frames = process_editor.DEFAULT_GROUP_FINAL_CONFIRM_FRAMES
+        try:
+            padding_ratio = max(0.0, float(config.get(
+                "padding_ratio", process_editor.DEFAULT_GROUP_FINAL_PADDING_RATIO
+            )))
+        except (TypeError, ValueError):
+            padding_ratio = process_editor.DEFAULT_GROUP_FINAL_PADDING_RATIO
+        try:
+            window_frames = max(confirm_frames, int(config.get(
+                "window_frames", process_editor.DEFAULT_GROUP_FINAL_WINDOW_FRAMES
+            )))
+        except (TypeError, ValueError):
+            window_frames = process_editor.DEFAULT_GROUP_FINAL_WINDOW_FRAMES
+
+        first_idx = min(group_indices)
+        group_name = self._step_order_group(self.process_steps[first_idx]) or str(first_idx + 1)
+        anchor_boxes = self._target_boxes_for_group_final(
+            detections, anchor_targets, padding_ratio
+        )
+        # A cycle should never keep two audits for the same logical group alive.
+        self.pending_group_final_checks = [
+            audit for audit in self.pending_group_final_checks
+            if audit.get("group_start") != first_idx
+        ]
+        self.pending_group_final_checks.append({
+            "group": group_name,
+            "group_start": first_idx,
+            "anchor_text": anchor_text,
+            "expected_text": expected_text,
+            "wrong_text": wrong_text,
+            "anchor_targets": anchor_targets,
+            "expected_targets": expected_targets,
+            "wrong_targets": wrong_targets,
+            "anchor_boxes": anchor_boxes,
+            "confirm_frames": confirm_frames,
+            "window_frames": window_frames,
+            "padding_ratio": padding_ratio,
+            "age": 0,
+            "correct_hits": 0,
+            "wrong_hits": 0,
+        })
+        return True
+
+    def _check_pending_group_final_checks(self, detections):
+        """Return (new_alarm, held_message, alarm_key) without changing workflow/NG state."""
+        held_message = ""
+        held_key = ""
+        if self.group_final_alert_frames > 0:
+            held_message = self.group_final_alert_message
+            held_key = self.group_final_alert_key
+            self.group_final_alert_frames -= 1
+            if self.group_final_alert_frames <= 0:
+                self.group_final_alert_message = ""
+                self.group_final_alert_key = ""
+
+        new_alarm = False
+        for audit in list(self.pending_group_final_checks):
+            audit["age"] += 1
+            padding_ratio = audit["padding_ratio"]
+            current_anchor_boxes = self._target_boxes_for_group_final(
+                detections, audit["anchor_targets"], padding_ratio
+            )
+            if current_anchor_boxes:
+                audit["anchor_boxes"] = current_anchor_boxes
+            anchor_boxes = audit.get("anchor_boxes") or []
+            if not anchor_boxes:
+                audit["correct_hits"] = 0
+                audit["wrong_hits"] = 0
+            else:
+                hand_boxes = [
+                    self.engine.expand_bbox(detection["bbox"], 0.02)
+                    for detection in (detections or [])
+                    if detection.get("bbox")
+                    and self.engine.is_hand_class(detection.get("class", ""))
+                ]
+                hand_in_anchor = any(
+                    self.engine.check_intersection(hand_box, anchor_box)
+                    for hand_box in hand_boxes
+                    for anchor_box in anchor_boxes
+                )
+                if hand_in_anchor:
+                    audit["correct_hits"] = 0
+                    audit["wrong_hits"] = 0
+                else:
+                    expected_boxes = self._target_boxes_for_group_final(
+                        detections, audit["expected_targets"], padding_ratio
+                    )
+                    wrong_boxes = self._target_boxes_for_group_final(
+                        detections, audit["wrong_targets"], padding_ratio
+                    )
+                    expected_at_anchor = any(
+                        self.engine.check_intersection(item_box, anchor_box)
+                        for item_box in expected_boxes
+                        for anchor_box in anchor_boxes
+                    )
+                    wrong_at_anchor = any(
+                        self.engine.check_intersection(item_box, anchor_box)
+                        for item_box in wrong_boxes
+                        for anchor_box in anchor_boxes
+                    )
+                    if expected_at_anchor:
+                        audit["correct_hits"] += 1
+                        audit["wrong_hits"] = 0
+                    elif wrong_at_anchor:
+                        audit["wrong_hits"] += 1
+                        audit["correct_hits"] = 0
+                    else:
+                        audit["correct_hits"] = 0
+                        audit["wrong_hits"] = 0
+
+            if audit["correct_hits"] >= audit["confirm_frames"]:
+                self.pending_group_final_checks.remove(audit)
+                continue
+            if audit["wrong_hits"] >= audit["confirm_frames"]:
+                message = (
+                    f"❌ 乱序组【{audit['group']}】终态异常："
+                    f"【{audit['anchor_text']}】位置应看到【{audit['expected_text']}】，"
+                    f"当前却检测到【{audit['wrong_text']}】。已报警，后续工序继续。"
+                )
+                key = f"group_final_{audit['group_start']}_{int(time.time() * 1000)}"
+                self.group_final_alert_message = message
+                self.group_final_alert_frames = 90
+                self.group_final_alert_key = key
+                held_message = message
+                held_key = key
+                new_alarm = True
+                self.pending_group_final_checks.remove(audit)
+                break
+            if audit["age"] >= audit["window_frames"]:
+                self.pending_group_final_checks.remove(audit)
+
+        return new_alarm, held_message, held_key
+
     def _target_options(self, target):
         return self.engine.target_options(target)
 
     def _target_display_name(self, target):
         return self.engine.target_display_name(target, self.engine.eng_to_zh)
+
+    def _parse_state_alarm_rules(self, raw_rules):
+        """Parse global state alarms: bad item targets intersecting anchor targets."""
+        rules = []
+
+        def parse_alarm_mode(value, buzzer=None):
+            if buzzer is not None:
+                return "red_buzzer" if bool(buzzer) else "red_only"
+            return process_editor.normalize_state_alarm_mode(value)
+
+        def add_rule(item_text, target_text, label="", padding_ratio=None,
+                     alarm_mode=None, buzzer=None):
+            item_targets = self.engine.parse_step_text(str(item_text or ""))
+            anchor_targets = self.engine.parse_step_text(str(target_text or ""))
+            if not item_targets or not anchor_targets:
+                return
+            if padding_ratio in (None, ""):
+                padding_value = None
+            else:
+                try:
+                    padding_value = max(0.0, float(padding_ratio))
+                except (TypeError, ValueError):
+                    padding_value = None
+            mode = parse_alarm_mode(alarm_mode, buzzer=buzzer) or "red_buzzer"
+            rules.append({
+                "item_targets": item_targets,
+                "anchor_targets": anchor_targets,
+                "label": str(label or "").strip(),
+                "padding_ratio": padding_value,
+                "alarm_mode": mode,
+                "buzzer": mode == "red_buzzer",
+            })
+
+        if isinstance(raw_rules, list):
+            for entry in raw_rules:
+                if not isinstance(entry, dict) or entry.get("enabled", True) is False:
+                    continue
+                add_rule(
+                    entry.get("item") or entry.get("bad_item") or entry.get("wrong_item"),
+                    entry.get("target") or entry.get("anchor"),
+                    entry.get("name") or entry.get("label") or "",
+                    entry.get("padding_ratio"),
+                    entry.get("alarm_mode") or entry.get("alarm"),
+                    entry.get("buzzer") if "buzzer" in entry else None,
+                )
+            return rules
+
+        for raw_line in str(raw_rules or "").splitlines():
+            parsed_line = process_editor.parse_state_alarm_rule_line(raw_line)
+            if parsed_line.get("ignored") or parsed_line.get("error"):
+                continue
+            alarm_mode = parsed_line.get("alarm_mode") or "red_buzzer"
+            label = parsed_line.get("label", str(raw_line).strip())
+            if parsed_line.get("item_text") is not None:
+                add_rule(
+                    parsed_line.get("item_text"),
+                    parsed_line.get("target_text"),
+                    label,
+                    alarm_mode=alarm_mode,
+                )
+                continue
+
+            detected_targets = self.engine.parse_step_text(parsed_line.get("freeform_text", ""))
+            if len(detected_targets) >= 2:
+                mode = alarm_mode or "red_buzzer"
+                rules.append({
+                    "item_targets": detected_targets[:1],
+                    "anchor_targets": detected_targets[1:2],
+                    "label": label,
+                    "padding_ratio": None,
+                    "alarm_mode": mode,
+                    "buzzer": mode == "red_buzzer",
+                })
+
+        return rules
+
+    def _state_alarm_uses_buzzer(self, rule_idx):
+        if 0 <= int(rule_idx) < len(self.state_alarm_rules or []):
+            return bool(self.state_alarm_rules[int(rule_idx)].get("buzzer", True))
+        return True
+
+    def _check_state_alarm(self, detections):
+        hit_idx = -1
+        hit_message = ""
+        for idx, rule in enumerate(self.state_alarm_rules or []):
+            item_targets = rule.get("item_targets") or []
+            anchor_targets = rule.get("anchor_targets") or []
+            if not item_targets or not anchor_targets:
+                continue
+            padding_ratio = rule.get("padding_ratio")
+            if padding_ratio is None:
+                padding_ratio = self.state_alarm_padding_ratio
+            if not self.engine.target_groups_intersect(
+                    item_targets,
+                    anchor_targets,
+                    detections,
+                    padding_ratio=padding_ratio):
+                continue
+            item_name = "/".join(
+                name for name in (self._target_display_name(target) for target in item_targets) if name
+            ) or "错误物品"
+            anchor_name = "/".join(
+                name for name in (self._target_display_name(target) for target in anchor_targets) if name
+            ) or "参照目标"
+            hit_idx = idx
+            hit_message = f"持续状态报警：检测到【{item_name}】与【{anchor_name}】处于禁止关系！"
+            break
+
+        if hit_idx >= 0:
+            self.state_alarm_hit_counts[hit_idx] = min(
+                self.state_alarm_confirm_frames,
+                self.state_alarm_hit_counts.get(hit_idx, 0) + 1,
+            )
+            for idx in list(self.state_alarm_hit_counts):
+                if idx != hit_idx:
+                    self.state_alarm_hit_counts[idx] = 0
+            self.state_alarm_clear_frames = 0
+            if (self.state_alarm_active_idx == hit_idx
+                    or self.state_alarm_hit_counts[hit_idx] >= self.state_alarm_confirm_frames):
+                self.state_alarm_active_idx = hit_idx
+                self.state_alarm_message = hit_message
+                return True, hit_message, hit_idx
+            return False, "", -1
+
+        for idx in list(self.state_alarm_hit_counts):
+            self.state_alarm_hit_counts[idx] = 0
+        if self.state_alarm_active_idx is not None:
+            self.state_alarm_clear_frames += 1
+            if self.state_alarm_clear_frames < self.state_alarm_release_frames:
+                return True, self.state_alarm_message, self.state_alarm_active_idx
+            self.state_alarm_active_idx = None
+            self.state_alarm_clear_frames = 0
+            self.state_alarm_message = ""
+        return False, "", -1
 
     def _target_option_set(self, targets):
         options = set()
@@ -774,6 +1903,22 @@ class VisionThread(QThread):
         except (TypeError, ValueError):
             return 1.5
 
+    def _step_completion_hold_seconds(self, step_dict):
+        """读取单步的结果确认停留时长。"""
+        try:
+            return max(
+                0.0,
+                float(
+                    step_dict.get(
+                        "completion_hold_seconds",
+                        process_editor.DEFAULT_COMPLETION_HOLD_SECONDS,
+                    )
+                    or 0.0
+                ),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return process_editor.DEFAULT_COMPLETION_HOLD_SECONDS
+
     def _clear_step_cooldown(self, step_idx):
         self.step_cooldown_until_by_idx.pop(step_idx, None)
         self.step_cooldown_status_by_idx.pop(step_idx, None)
@@ -783,6 +1928,9 @@ class VisionThread(QThread):
         self.step_prereq_status_by_idx.pop(step_idx, None)
         self.step_release_status_by_idx.pop(step_idx, None)
         self.wrong_pair_counters.pop(step_idx, None)
+        self.step_result_status_by_idx.pop(step_idx, None)
+        self.step_result_hit_counts.pop(step_idx, None)
+        self.step_post_action_latched.discard(step_idx)
 
     def _set_step_cooldown(self, step_idx, step_dict):
         if not self._is_time_multi_step(step_dict):
@@ -821,21 +1969,386 @@ class VisionThread(QThread):
             return False
         return self._cooldown_remaining(step_idx) > 0
 
-    def _evaluate_step_by_config(self, step_idx, step_dict, targets, detections, engine):
+    @staticmethod
+    def _step_result_check(step_dict):
+        raw = step_dict.get("result_check", {}) if isinstance(step_dict, dict) else {}
+        raw = dict(raw) if isinstance(raw, dict) else {}
+        mode = str(raw.get("mode") or "present")
+        if mode not in {
+            "present", "absent", "targets_intersect", "targets_separate"
+        }:
+            mode = "present"
+        try:
+            stable_frames = max(1, min(300, int(raw.get("stable_frames", 5))))
+        except (TypeError, ValueError):
+            stable_frames = 5
+        timing = str(
+            raw.get("timing") or process_editor.DEFAULT_RESULT_CHECK_TIMING
+        ).strip()
+        if timing not in {"before_completion", "after_completion"}:
+            timing = process_editor.DEFAULT_RESULT_CHECK_TIMING
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "target": str(raw.get("target") or "").strip(),
+            "mode": mode,
+            "stable_frames": stable_frames,
+            "timing": timing,
+        }
+
+    def _post_completion_required(self, step_idx, step_dict=None):
+        if not (0 <= step_idx < len(self.process_steps)):
+            return False
+        step_dict = step_dict or self.process_steps[step_idx]
+        result_check = self._step_result_check(step_dict)
+        if result_check.get("enabled") and result_check.get("timing") == "after_completion":
+            return True
+        wiring = self._step_wiring_config(step_idx, step_dict)
+        return bool(
+            wiring.get("enabled")
+            and wiring.get("step_mode") == "after_completion"
+        )
+
+    def _activate_post_completion_check(self, step_idx, group_indices=None):
+        if not (0 <= step_idx < len(self.process_steps)):
+            return False
+        step_dict = self.process_steps[step_idx]
+        wiring = self._step_wiring_config(step_idx, step_dict)
+        visual = self._step_result_check(step_dict)
+        if wiring.get("enabled") and wiring.get("step_mode") == "after_completion":
+            check_type = "wiring"
+            name = wiring.get("stage_name", f"步骤{step_idx + 1}接线终态验收")
+            self.step_wiring_monitor.configure([wiring])
+            self.active_step_wiring_idx = step_idx
+        elif visual.get("enabled") and visual.get("timing") == "after_completion":
+            check_type = "visual"
+            name = f"步骤{step_idx + 1}最终结果验收"
+            self.step_result_hit_counts.pop(step_idx, None)
+            self.step_result_status_by_idx.pop(step_idx, None)
+        else:
+            return False
+        self.post_completion_check = {
+            "step_idx": step_idx,
+            "group_indices": list(group_indices or []),
+            "type": check_type,
+            "name": name,
+            "started_at": time.time(),
+            "progress": 0,
+            "satisfied": False,
+            "message": "工序动作已完成100%，正在进行独立附加条件验收",
+        }
+        self.current_step_idx = min(group_indices) if group_indices else step_idx
+        self.step_start_time = time.time()
+        return True
+
+    def _evaluate_post_completion_check(self, detections):
+        runtime = self.post_completion_check
+        if not runtime:
+            return False, ""
+        step_idx = int(runtime["step_idx"])
+        step_dict = self.process_steps[step_idx]
+        if runtime.get("type") == "wiring":
+            status = dict(self.step_wiring_status or {})
+            satisfied = bool(
+                status.get("configured")
+                and status.get("step_idx") == step_idx
+                and status.get("satisfied")
+            )
+            check_progress = int(status.get("progress", 0) or 0)
+            expected = " → ".join(status.get("expected_order", []) or []) or "已配置终态"
+            actual = " → ".join(
+                status.get("actual_order", []) or status.get("visible_order", []) or []
+            ) or "等待线缆完整出现"
+            message = f"独立接线验收：目标 {expected}；当前 {actual}"
+        else:
+            satisfied, check_progress = self._apply_visual_result_gate(
+                step_idx, step_dict, detections, (True, 100)
+            )
+            status = dict(self.step_result_status_by_idx.get(step_idx, {}) or {})
+            message = status.get("message", "正在检查最终视觉状态")
+        runtime.update({
+            "progress": min(100, int(check_progress or 0)),
+            "satisfied": bool(satisfied),
+            "message": message,
+        })
+        if not satisfied:
+            return False, f"🧪 步骤 {step_idx + 1} 已完成100%，{message}"
+
+        cp = self.ng_tracker.current_product
+        if cp and step_idx < len(cp.get("step_records", [])):
+            cp["step_records"][step_idx]["post_completion_check"] = {
+                "passed": True,
+                "type": runtime.get("type"),
+                "passed_at": datetime.now().strftime("%H:%M:%S"),
+            }
+        group_indices = list(runtime.get("group_indices") or [])
+        self.post_completion_check = None
+        self.step_result_hit_counts.pop(step_idx, None)
+        self.step_result_status_by_idx.pop(step_idx, None)
+        self.step_post_action_latched.discard(step_idx)
+        self.step_wiring_monitor.configure([])
+        self.active_step_wiring_idx = None
+        if group_indices:
+            self._schedule_group_final_check(group_indices, detections)
+            self.current_step_idx = max(group_indices) + 1
+        else:
+            self.current_step_idx = step_idx + 1
+        self.step_start_time = time.time()
+        if self.current_step_idx >= len(self.process_steps):
+            self._finish_and_restart_cycle()
+            return True, "✅ 独立附加条件验收通过，当前产品工序全部完成"
+        return True, f"✅ 步骤 {step_idx + 1} 独立附加条件验收通过，进入下一工序"
+
+    def _apply_visual_result_gate(self, step_idx, step_dict, detections, result):
+        """Use the stable final visual state as the authoritative completion result.
+
+        The action detector is only supporting evidence.  This lets a completed
+        assembly pass after an occluded action, while preventing a detected hand
+        action from passing when the visible final state is still wrong.
+        """
+        config = self._step_result_check(step_dict)
+        if not config["enabled"]:
+            self.step_result_status_by_idx.pop(step_idx, None)
+            self.step_result_hit_counts.pop(step_idx, None)
+            return result
+
+        action_done, action_progress = result
+        target_text = config["target"]
+        relation_mode = config["mode"] in {
+            "targets_intersect", "targets_separate"
+        }
+        if relation_mode:
+            targets = [
+                target for target in self._targets_for_step(step_dict)
+                if not self.engine.target_is_hand(target)
+            ][:2]
+            target_text = " 与 ".join(
+                self.engine.target_display_name(target, self.engine.eng_to_zh)
+                for target in targets
+            ) or "本步骤两个目标"
+            present = bool(
+                len(targets) == 2
+                and self.engine.check_presence(targets, detections)
+            )
+            intersects = bool(
+                present and self.engine.target_groups_intersect(
+                    [targets[0]], [targets[1]], detections, 0.0
+                )
+            )
+            condition_met = bool(
+                present and (
+                    intersects
+                    if config["mode"] == "targets_intersect"
+                    else not intersects
+                )
+            )
+        else:
+            targets = self.engine.parse_step_text(target_text) or (
+                [target_text] if target_text else []
+            )
+            present = bool(targets and self.engine.check_presence(targets, detections))
+            intersects = False
+            condition_met = present if config["mode"] == "present" else not present
+        hand_in_zone = False
+        require_release = bool(self._requires_hand_release(step_dict))
+        if require_release or config["mode"] in {"absent", "targets_separate"}:
+            action_targets = self._targets_for_step(step_dict)
+            if action_targets:
+                hand_in_zone = self.engine.hand_in_operation_zone(
+                    action_targets, detections, 0.10
+                )
+                if hand_in_zone:
+                    condition_met = False
+        hits = int(self.step_result_hit_counts.get(step_idx, 0))
+        if condition_met and targets:
+            hits += 1
+        else:
+            hits = 0
+        self.step_result_hit_counts[step_idx] = hits
+        required_hits = int(config["stable_frames"])
+        if require_release:
+            required_hits = max(
+                required_hits, int(self._hand_release_frames(step_dict))
+            )
+        satisfied = bool(targets and hits >= required_hits)
+        if config["mode"] == "targets_intersect":
+            state_text = "已装配/相交" if intersects else "尚未装配/相交"
+            expected_text = "应已装配/相交"
+        elif config["mode"] == "targets_separate":
+            state_text = "仍相交" if intersects else "已分离"
+            expected_text = "应已分离"
+        else:
+            state_text = "已识别到" if present else "未识别到"
+            expected_text = "应识别到" if config["mode"] == "present" else "应识别不到"
+        self.step_result_status_by_idx[step_idx] = {
+            "configured": True,
+            "target": target_text,
+            "mode": config["mode"],
+            "present": present,
+            "intersects": intersects,
+            "condition_met": condition_met,
+            "hand_in_zone": hand_in_zone,
+            "action_done": bool(action_done),
+            "hits": hits,
+            "required_hits": required_hits,
+            "satisfied": satisfied,
+            "message": f"最终结果：{state_text}【{target_text}】，{expected_text}",
+        }
+        if satisfied:
+            return True, 100
+        gate_progress = int(round(hits / required_hits * 99))
+        return False, max(
+            min(99, int(action_progress or 0)), min(99, gate_progress)
+        )
+
+    def _step_wiring_config(self, step_idx, step_dict=None):
+        if step_idx in self.step_wiring_configs:
+            config = self.step_wiring_configs[step_idx]
+        else:
+            raw = (step_dict or {}).get("step_wiring_check", {})
+            config = normalize_step_wiring_check(raw, step_idx)
+        if step_dict and self._requires_hand_release(step_dict):
+            config = dict(config)
+            config["release_frames"] = max(
+                int(config.get("release_frames", 1) or 1),
+                int(self._hand_release_frames(step_dict)),
+            )
+        return config
+
+    def _unordered_group_wiring_config(self, group_indices):
+        """Return the one post-action wiring check shared by an unordered group."""
+        for index in group_indices or []:
+            if not (0 <= index < len(self.process_steps)):
+                continue
+            config = self._step_wiring_config(index, self.process_steps[index])
+            if config.get("enabled") and config.get("step_mode") in {
+                "after_action", "after_completion"
+            }:
+                return index, config
+        return None, None
+
+    def _evaluate_step_wiring_gate(self, step_idx, step_dict, result):
+        config = self._step_wiring_config(step_idx, step_dict)
+        if not config.get("enabled"):
+            return result
+        action_done, action_progress = result
+        after_action = config.get("step_mode") == "after_action"
+        if after_action:
+            if action_done:
+                self.step_post_action_latched.add(step_idx)
+            if step_idx not in self.step_post_action_latched:
+                # 附加验收不能替代本工序原本的动作判定。动作尚未完成时，
+                # 进度完全沿用原动作，接线布局即使已经部分/全部可见也不参与计算。
+                return result
+        status = dict(self.step_wiring_status or {})
+        satisfied = bool(
+            status.get("configured")
+            and status.get("step_idx") == step_idx
+            and status.get("satisfied")
+        )
+        if satisfied:
+            return True, 100
+        if after_action:
+            # 原动作已经完成，固定显示为“等待最终验收”，避免接线布局的
+            # 1/2、2/2 可见度把原动作进度错误地改成 45% 或 90%。
+            return False, 99
+        return False, min(99, max(
+            min(99, int(action_progress or 0)), int(status.get("progress", 0))
+        ))
+
+    def _apply_step_completion_gates(
+        self, step_idx, step_dict, detections, result, suppress_wiring=False
+    ):
+        result_check_enabled = bool(
+            self._step_result_check(step_dict).get("enabled")
+            and self._step_result_check(step_dict).get("timing") != "after_completion"
+        )
+        wiring_config = self._step_wiring_config(step_idx, step_dict)
+        wiring_enabled = bool(
+            wiring_config.get("enabled")
+            and wiring_config.get("step_mode") != "after_completion"
+            and not suppress_wiring
+        )
+        legacy_slot_gate = bool(
+            str(step_dict.get("slot_expectation", "") or "").strip()
+            and step_dict.get("slot_expectation_block", True)
+        )
+        slot_result = self._apply_slot_expectation_gate(step_dict, result)
+        final_result_gates = []
+        if legacy_slot_gate:
+            final_result_gates.append(slot_result)
+        if result_check_enabled:
+            final_result_gates.append(
+                self._apply_visual_result_gate(
+                    step_idx, step_dict, detections, result
+                )
+            )
+        else:
+            self.step_result_status_by_idx.pop(step_idx, None)
+            self.step_result_hit_counts.pop(step_idx, None)
+        if wiring_enabled:
+            final_result_gates.append(
+                self._evaluate_step_wiring_gate(step_idx, step_dict, result)
+            )
+        if not final_result_gates:
+            return slot_result
+        completed = all(done for done, _progress in final_result_gates)
+        if completed:
+            return True, 100
+        return False, min(99, min(
+            int(progress or 0) for _done, progress in final_result_gates
+        ))
+
+    def _evaluate_step_by_config(
+        self, step_idx, step_dict, targets, detections, engine,
+        suppress_wiring=False,
+    ):
         if not self._explicit_prereq_satisfied(step_idx, step_dict):
             return False, 0
 
         if self._is_step_cooling_down(step_idx, step_dict):
             return False, 0
 
+        expectation = str(step_dict.get("slot_expectation", "") or "").strip()
+        if expectation and bool(step_dict.get("slot_expectation_only", False)):
+            status = self.slot_monitor.evaluate_expectation(expectation)
+            self.slot_expectation_status = status
+            if status.get("satisfied", False):
+                return True, 100
+            if not status.get("settled", False):
+                return False, 0
+            expected = status.get("expected", {}) or {}
+            actual = status.get("actual", {}) or {}
+            matched = sum(
+                1 for slot_name, target in expected.items()
+                if actual.get(slot_name) == target
+            )
+            progress = int(round(matched / max(1, len(expected)) * 100))
+            return False, min(99, progress)
+
+        wiring_config = self._step_wiring_config(step_idx, step_dict)
+        if (not suppress_wiring and wiring_config.get("enabled")
+                and wiring_config.get("step_mode") == "result_only"):
+            return self._evaluate_step_wiring_gate(step_idx, step_dict, (True, 100))
+
         difficulty = step_dict.get("difficulty", "中等")
         if self._is_hand_touch_step(step_dict):
             self.step_action_status_by_idx.pop(step_idx, None)
-            self.step_release_status_by_idx.pop(step_idx, None)
-            return engine.evaluate_hand_touch_step(
+            result = engine.evaluate_hand_touch_step(
                 targets, detections, difficulty,
                 stable_frames_override=self._step_stable_frames(step_dict),
                 padding_ratio_override=self._step_padding_ratio(step_dict),
+                require_hand_release=self._requires_hand_release(step_dict),
+                hand_release_padding=self._hand_release_padding(step_dict),
+                hand_release_frames=self._hand_release_frames(step_dict),
+            )
+            release_status = dict(getattr(engine, "release_status", {}) or {})
+            if release_status:
+                self.step_release_status_by_idx[step_idx] = release_status
+            else:
+                self.step_release_status_by_idx.pop(step_idx, None)
+            return self._apply_step_completion_gates(
+                step_idx, step_dict, detections, result,
+                suppress_wiring=suppress_wiring,
             )
         if self._is_detach_step(step_dict):
             self.step_action_status_by_idx.pop(step_idx, None)
@@ -845,6 +2358,9 @@ class VisionThread(QThread):
                 assembly_ready=self._detach_prereq_satisfied(step_idx),
                 stable_frames_override=self._step_stable_frames(step_dict),
                 padding_ratio_override=self._step_padding_ratio(step_dict),
+                missing_enabled=self._detach_missing_enabled(step_dict),
+                missing_frames=self._detach_missing_frames(step_dict),
+                missing_padding_ratio=self._detach_missing_padding(step_dict),
             )
             detach_status = dict(getattr(engine, "detach_status", {}) or {})
             if detach_status:
@@ -853,7 +2369,10 @@ class VisionThread(QThread):
                 detach_status["removed_name"] = self.engine.target_display_name(removed_target, self.engine.eng_to_zh)
                 detach_status["base_name"] = self.engine.target_display_name(base_target, self.engine.eng_to_zh)
                 self.step_detach_status_by_idx[step_idx] = detach_status
-            return result
+            return self._apply_step_completion_gates(
+                step_idx, step_dict, detections, result,
+                suppress_wiring=suppress_wiring,
+            )
         action_confirm_frames = self._step_action_confirm_frames(step_dict)
         result = engine.evaluate_step(
             targets,
@@ -879,7 +2398,240 @@ class VisionThread(QThread):
             self.step_release_status_by_idx[step_idx] = release_status
         else:
             self.step_release_status_by_idx.pop(step_idx, None)
+        return self._apply_step_completion_gates(
+            step_idx, step_dict, detections, result,
+            suppress_wiring=suppress_wiring,
+        )
+
+    def _apply_slot_expectation_gate(self, step_dict, result):
+        """Optionally turn a normal action step into a final-layout acceptance step."""
+        expectation = str(step_dict.get("slot_expectation", "") or "").strip()
+        if not expectation:
+            return result
+        status = self.slot_monitor.evaluate_expectation(expectation)
+        self.slot_expectation_status = status
+        if not bool(step_dict.get("slot_expectation_block", True)):
+            return result
+        done, progress = result
+        if done and not status.get("satisfied", False):
+            return False, min(99, int(progress or 0))
         return result
+
+    def _active_slot_expectation_step(self):
+        if self.remediation_mode and self.remediation_step_idx is not None:
+            index = self.remediation_step_idx
+        else:
+            index = self.current_step_idx
+        if 0 <= index < len(self.process_steps):
+            return self.process_steps[index]
+        return None
+
+    def _active_runtime_step_index(self):
+        if self.remediation_mode and self.remediation_step_idx is not None:
+            return self.remediation_step_idx
+        return self.current_step_idx
+
+    def _update_active_step_wiring(self, detections):
+        runtime_step_idx = self._active_runtime_step_index()
+        step_idx = runtime_step_idx
+        config = None
+        group_indices = []
+        group_wiring = False
+        if not self.remediation_mode:
+            group_indices = self._unordered_group_indices(runtime_step_idx)
+            group_config_idx, group_config = self._unordered_group_wiring_config(
+                group_indices
+            )
+            if group_config is not None:
+                step_idx = group_config_idx
+                config = group_config
+                group_wiring = True
+        if config is None and 0 <= step_idx < len(self.process_steps):
+            candidate = self._step_wiring_config(step_idx, self.process_steps[step_idx])
+            if candidate.get("enabled"):
+                config = candidate
+
+        if config is None:
+            if self.active_step_wiring_idx is not None:
+                self.step_wiring_monitor.configure([])
+            self.active_step_wiring_idx = None
+            self.step_wiring_status = {
+                "configured": False, "satisfied": True, "settled": True,
+                "mismatches": [], "progress": 100,
+            }
+            return {"status": None, "alarms": []}
+
+        if self.active_step_wiring_idx != step_idx:
+            self.step_wiring_monitor.configure([config])
+            self.active_step_wiring_idx = step_idx
+
+        group_actions_done = bool(
+            group_wiring
+            and group_indices
+            and all(self._step_record_status(index) != "pending" for index in group_indices)
+        )
+        waiting_phase = None
+        if group_wiring and not group_actions_done:
+            waiting_phase = "waiting_group_actions"
+        elif not group_wiring and config.get("step_mode") == "after_action":
+            if step_idx not in self.step_post_action_latched:
+                waiting_phase = "waiting_action"
+        elif not group_wiring and config.get("step_mode") == "after_completion":
+            active_post_check = bool(
+                self.post_completion_check
+                and self.post_completion_check.get("step_idx") == step_idx
+            )
+            if not active_post_check:
+                waiting_phase = "waiting_completion"
+
+        if waiting_phase:
+            # “附加到本工序”是严格的后置检查：先让原动作状态机独立完成，
+            # 乱序组则要等组内所有动作完成，之后才采集接线顺序和错误报警。
+            if (self.step_wiring_status.get("step_idx") != step_idx
+                    or self.step_wiring_status.get("phase") != waiting_phase):
+                self.step_wiring_monitor.configure([config])
+            status = {
+                "configured": True,
+                "step_idx": step_idx,
+                "group_indices": list(group_indices) if group_wiring else [],
+                "name": (
+                    f"乱序组接线验收（步骤{group_indices[0] + 1}-{group_indices[-1] + 1}）"
+                    if group_wiring else
+                    config.get("stage_name", f"步骤{step_idx + 1}接线验收")
+                ),
+                "phase": waiting_phase,
+                "expected_order": list(config.get("expected_targets", []) or []),
+                "actual_order": [],
+                "settled": False,
+                "satisfied": False,
+                "mismatches": [],
+                "progress": 0,
+            }
+            self.step_wiring_status = status
+            return {"status": status, "alarms": []}
+
+        result = self.step_wiring_monitor.update(detections, self.engine)
+        statuses = list(result.get("statuses", []))
+        raw_status = statuses[0] if statuses else {}
+        expected = list(config.get("expected_targets", []) or [])
+        if config.get("monitor_type") == "relative_order":
+            actual = list(raw_status.get("actual_order", []) or [])
+            visible = list(raw_status.get("live_order", []) or [])
+        else:
+            slots = raw_status.get("slots", {}) or {}
+            actual = [slots.get(name, "未知") for name in config.get("slot_names", [])]
+            visible = [value for value in actual if value not in ("", "未知", "未知槽位")]
+        settled = raw_status.get("phase") == "monitoring"
+        satisfied = bool(settled and len(actual) == len(expected) and actual == expected)
+        matched = sum(
+            1 for actual_target, expected_target in zip(actual, expected)
+            if actual_target == expected_target
+        )
+        if satisfied:
+            progress = 100
+        elif settled and actual:
+            progress = min(99, int(round(matched / max(1, len(expected)) * 99)))
+        else:
+            progress = min(90, int(round(len(visible) / max(1, len(expected)) * 90)))
+        mismatches = [] if satisfied or not settled else [
+            f"当前为{' → '.join(actual) or '未知'}，正确应为{' → '.join(expected)}"
+        ]
+        status = dict(raw_status)
+        status.update({
+            "configured": True,
+            "step_idx": step_idx,
+            "group_indices": list(group_indices) if group_wiring else [],
+            "name": (
+                f"乱序组接线验收（步骤{group_indices[0] + 1}-{group_indices[-1] + 1}）"
+                if group_wiring else
+                config.get("stage_name", f"步骤{step_idx + 1}接线验收")
+            ),
+            "expected_order": expected,
+            "actual_order": actual,
+            "settled": settled,
+            "satisfied": satisfied,
+            "mismatches": mismatches,
+            "progress": progress,
+        })
+        self.step_wiring_status = status
+
+        explicit_wrong = {
+            tuple(combination) for combination in config.get("wrong_combinations", [])
+        }
+        alarm_armed = True
+        wrong = bool(
+            alarm_armed
+            and
+            settled and actual != expected and (
+                tuple(actual) in explicit_wrong
+                or config.get("alarm_all_mismatches", False)
+            )
+        )
+        alarms = []
+        if wrong:
+            mode = config.get("alarm_mode", "red_buzzer")
+            alarms.append({
+                "key": f"step_wiring_{step_idx}",
+                "message": (
+                    f"步骤{step_idx + 1}接线结果错误：当前"
+                    f"{' → '.join(actual) or '未识别完整'}，正确应为"
+                    f"{' → '.join(expected)}"
+                ),
+                "buzzer": mode != "red_only",
+                "alarm_mode": mode,
+            })
+        return {"status": status, "alarms": alarms}
+
+    def _update_continuous_monitors(self, detections):
+        state_result = self.toggle_state_monitor.update(detections, self.engine)
+        self.toggle_state_statuses = list(state_result.get("statuses", []))
+        events = list(state_result.get("events", []))
+        if events:
+            self.monitor_event_log.extend(events)
+            self.monitor_event_log = self.monitor_event_log[-200:]
+            current_product = self.ng_tracker.current_product
+            if current_product is not None:
+                current_product.setdefault("runtime_state_events", []).extend(events)
+
+        slot_result = self.slot_monitor.update(detections, self.engine)
+        self.slot_monitor_statuses = list(slot_result.get("statuses", []))
+        step_wiring_result = self._update_active_step_wiring(detections)
+        if step_wiring_result.get("status"):
+            self.slot_monitor_statuses.append(step_wiring_result["status"])
+        sequence_result = self.result_sequence_monitor.update(detections, self.engine)
+        self.result_sequence_statuses = list(sequence_result.get("statuses", []))
+        sequence_events = list(sequence_result.get("events", []))
+        if sequence_events:
+            self.monitor_event_log.extend(sequence_events)
+            self.monitor_event_log = self.monitor_event_log[-200:]
+        active_step = self._active_slot_expectation_step()
+        expectation = active_step.get("slot_expectation", "") if active_step else ""
+        self.slot_expectation_status = self.slot_monitor.evaluate_expectation(expectation)
+        combined_result = dict(state_result)
+        combined_result["alarms"] = (
+            list(state_result.get("alarms", []))
+            + list(slot_result.get("alarms", []))
+            + list(step_wiring_result.get("alarms", []))
+            + list(sequence_result.get("alarms", []))
+        )
+        return combined_result
+
+    def _observed_slot_mismatch(self):
+        """Alarm only for an observed wrong connector, not for a still-empty slot."""
+        status = self.slot_expectation_status or {}
+        if not status.get("configured") or not status.get("settled") or status.get("satisfied"):
+            return None
+        expected = status.get("expected", {}) or {}
+        actual = status.get("actual", {}) or {}
+        mismatches = []
+        for slot_name, expected_target in expected.items():
+            actual_target = actual.get(slot_name, "未知槽位")
+            if actual_target not in ("空", "未知", "未知槽位", "") and actual_target != expected_target:
+                mismatches.append(f"{slot_name}：当前{actual_target}，应为{expected_target}")
+        if not mismatches:
+            return None
+        monitor_name = status.get("monitor_name") or status.get("monitor_id") or "槽位"
+        return f"接线布局错误【{monitor_name}】：" + "；".join(mismatches)
 
     def _record_aoi_status(self, step_idx, state=None, similarity=None, threshold=None, best_angle=None):
         cp = self.ng_tracker.current_product
@@ -913,12 +2665,47 @@ class VisionThread(QThread):
             self.unordered_completion_seq += 1
             self.unordered_completion_order[step_idx] = self.unordered_completion_seq
 
-    def _sync_current_idx_for_unordered_group(self, group_indices):
+    def _advance_completed_step_or_start_post_check(self, step_idx, detections=None):
+        """Advance a completed action, or expose its configured post-completion audit."""
+        step_dict = self.process_steps[step_idx]
+        self.step_progress_by_idx[step_idx] = 100
+        if self._step_order_group(step_dict):
+            self._remember_unordered_completion(step_idx)
+            return self._sync_current_idx_for_unordered_group(
+                self._unordered_group_indices(step_idx), detections
+            )
+        if self._post_completion_required(step_idx, step_dict):
+            self._activate_post_completion_check(step_idx)
+            return False
+        self.current_step_idx = step_idx + 1
+        return self.current_step_idx >= len(self.process_steps)
+
+    def _sync_current_idx_for_unordered_group(self, group_indices, detections=None):
         pending = [i for i in group_indices if self._step_record_status(i) == 'pending']
         if pending:
             self.current_step_idx = pending[0]
             self.step_start_time = time.time()
             return False
+        wiring_step_idx, wiring_config = self._unordered_group_wiring_config(group_indices)
+        if wiring_config is not None:
+            if (wiring_config.get("step_mode") == "after_completion"
+                    and not self.post_completion_check):
+                self._activate_post_completion_check(
+                    wiring_step_idx, group_indices=group_indices
+                )
+            status = dict(self.step_wiring_status or {})
+            wiring_satisfied = bool(
+                status.get("configured")
+                and status.get("step_idx") == wiring_step_idx
+                and status.get("satisfied")
+            )
+            if not wiring_satisfied:
+                # 完成后验收模式中，组内动作已经分别记为100%；这里只保留
+                # 一个独立验收阶段，不再把某个动作伪装成99%。
+                self.current_step_idx = min(group_indices)
+                self.step_start_time = time.time()
+                return False
+        self._schedule_group_final_check(group_indices, detections)
         self.current_step_idx = max(group_indices) + 1
         if self.current_step_idx >= len(self.process_steps):
             self._finish_and_restart_cycle()
@@ -930,6 +2717,9 @@ class VisionThread(QThread):
         group_indices = self._unordered_group_indices(self.current_step_idx)
         if not group_indices:
             return False, 0, ""
+        group_wiring_idx, group_wiring_config = self._unordered_group_wiring_config(
+            group_indices
+        )
 
         best_progress = 0
         best_progress_idx = None
@@ -945,7 +2735,16 @@ class VisionThread(QThread):
                 continue
             step_dict = self.process_steps[idx]
             targets = self._targets_for_step(step_dict)
-            if not targets:
+            wiring_config = self._step_wiring_config(idx, step_dict)
+            wiring_only = bool(
+                wiring_config.get("enabled")
+                and wiring_config.get("step_mode") == "result_only"
+            )
+            final_result_enabled = bool(
+                self._step_result_check(step_dict).get("enabled")
+                or wiring_config.get("enabled")
+            )
+            if not targets and not wiring_only and not final_result_enabled:
                 continue
             if idx not in self.unordered_step_engines:
                 eng = ProcessLogicEngine()
@@ -954,7 +2753,8 @@ class VisionThread(QThread):
                 eng.regex_pattern = self.engine.regex_pattern
                 self.unordered_step_engines[idx] = eng
             is_done, step_progress = self._evaluate_step_by_config(
-                idx, step_dict, targets, detections, self.unordered_step_engines[idx]
+                idx, step_dict, targets, detections, self.unordered_step_engines[idx],
+                suppress_wiring=group_wiring_config is not None,
             )
             self.step_progress_by_idx[idx] = step_progress
             action_state = self.step_action_status_by_idx.get(idx, {}).get("state")
@@ -966,6 +2766,8 @@ class VisionThread(QThread):
             if is_done:
                 self.step_progress_by_idx[idx] = 100
                 self.unordered_step_engines[idx].reset()
+                self.step_post_action_latched.discard(idx)
+                self.step_result_hit_counts.pop(idx, None)
                 # 一次实际动作只能完成一个乱序成员。其他成员的影子状态必须清零，
                 # 防止多个成员同时到 99% 后，一次离手把整组一起判成完成。
                 for other_idx in group_indices:
@@ -994,11 +2796,33 @@ class VisionThread(QThread):
         self.unordered_active_idx = None if completed_any else best_progress_idx
         finished_group = False
         if completed_any:
-            finished_group = self._sync_current_idx_for_unordered_group(group_indices)
+            finished_group = self._sync_current_idx_for_unordered_group(group_indices, detections)
         if finished_group:
             return True, 100, "乱序组已完成"
 
         pending_count = sum(1 for i in group_indices if self._step_record_status(i) == 'pending')
+        if pending_count == 0 and group_wiring_config is not None:
+            status = dict(self.step_wiring_status or {})
+            wiring_satisfied = bool(
+                status.get("configured")
+                and status.get("step_idx") == group_wiring_idx
+                and status.get("satisfied")
+            )
+            if not wiring_satisfied:
+                self.current_step_idx = min(group_indices)
+                self.unordered_active_idx = None
+                if group_wiring_config.get("step_mode") == "after_completion":
+                    if not self.post_completion_check:
+                        self._activate_post_completion_check(
+                            group_wiring_idx, group_indices=group_indices
+                        )
+                    return False, 100, "乱序组动作已全部完成100%，正在进行独立接线验收"
+                return False, 99, "乱序组动作已全部完成，正在检查最终接线状态"
+            if not completed_any:
+                finished_group = self._sync_current_idx_for_unordered_group(
+                    group_indices, detections
+                )
+            return finished_group, 100, "乱序组动作及最终接线验收已完成"
         alert = ""
         if pending_count > 0:
             alert = f"乱序组待完成: {pending_count}/{len(group_indices)}"
@@ -1009,16 +2833,22 @@ class VisionThread(QThread):
         engine.eng_to_zh = self.engine.eng_to_zh
         engine.regex_pattern = self.engine.regex_pattern
 
-    def _reset_jump_monitors(self, clear_restart_guard=False):
+    def _reset_jump_monitors(self, clear_restart_guard=False, preserve_alarm=False):
         self.final_step_engine.reset()
         self.final_sub_count = 0
         self.final_is_pausing = False
         self.final_pause_start_time = 0
         self.final_last_action_time = 0
-        self.workflow_monitor.reset_runtime(clear_restart_guard=clear_restart_guard)
+        self.workflow_monitor.reset_runtime(
+            clear_restart_guard=clear_restart_guard,
+            preserve_alarm=preserve_alarm,
+        )
 
-    def _activate_restart_guard(self):
-        self.workflow_monitor.arm_restart_guard(frames=75)
+    def _activate_restart_guard(self, preserve_alarm=False):
+        self.workflow_monitor.arm_restart_guard(
+            frames=75,
+            preserve_alarm=preserve_alarm,
+        )
 
     def _clear_restart_guard(self):
         self.workflow_monitor.restart_guard_active = False
@@ -1162,7 +2992,8 @@ class VisionThread(QThread):
         self.current_sub_count = 0
         self.is_pausing = False
         self.engine.reset()
-        self._reset_jump_monitors()
+        # 工序状态可以立即重置，但刚触发的跳步告警必须继续锁存到 2 秒结束。
+        self._reset_jump_monitors(preserve_alarm=True)
 
         self.step_progress_by_idx[jumped_to_idx] = 100
 
@@ -1181,15 +3012,11 @@ class VisionThread(QThread):
                 rec['prereq_violation_completed'] = True
                 rec['missing_prerequisite_steps'] = [idx + 1 for idx in missing_prereqs]
                 rec['reason'] = f"前置条件未完成时提前执行：{jump_msg}"
-        if self._step_order_group(jumped_step):
-            self._remember_unordered_completion(jumped_to_idx)
-            self._sync_current_idx_for_unordered_group(self._unordered_group_indices(jumped_to_idx))
-        else:
-            self.current_step_idx = jumped_to_idx + 1
+        self._advance_completed_step_or_start_post_check(jumped_to_idx)
 
         self.step_start_time = time.time()
-        if self.current_step_idx >= len(self.process_steps):
-            self._finish_and_restart_cycle()
+        if not self.post_completion_check and self.current_step_idx >= len(self.process_steps):
+            self._finish_and_restart_cycle(preserve_jump_alarm=True)
         return True
 
     def _display_process_steps(self):
@@ -1217,6 +3044,16 @@ class VisionThread(QThread):
             if suppress_unordered_runtime:
                 step_copy['_suppress_unordered_runtime'] = True
             step_copy['_runtime_progress'] = runtime_progress
+            jump_shadow_progress = int(
+                self.workflow_monitor.shadow_progress_by_idx.get(idx, 0) or 0
+            )
+            if (
+                self.show_jump_progress
+                and idx != self.current_step_idx
+                and self._step_record_status(idx) == "pending"
+                and jump_shadow_progress > 0
+            ):
+                step_copy['_jump_shadow_progress'] = jump_shadow_progress
             if idx < len(records):
                 step_copy['_runtime_status'] = records[idx].get('status', 'pending')
                 for key in ('aoi_similarity', 'aoi_threshold', 'aoi_state', 'aoi_best_angle'):
@@ -1313,6 +3150,14 @@ class VisionThread(QThread):
                 if self.ng_tracker.current_product:
                     self.ng_tracker.finalize_as_ng('手动重新开始，当前产品未完成')
                 self._reset_workflow_runtime()
+                self.slot_monitor.reset(preserve_calibration=True)
+                self.result_sequence_monitor.reset()
+                self.slot_monitor_statuses = []
+                self.result_sequence_statuses = []
+                self.slot_expectation_status = {
+                    "configured": False, "satisfied": True,
+                    "settled": True, "mismatches": [],
+                }
                 self.reset_signal = False
                 # 启动新产品追踪
                 if self.process_steps:
@@ -1391,27 +3236,65 @@ class VisionThread(QThread):
                 for step_dict in self.process_steps:
                     targets = self._targets_for_step(step_dict)
                     all_required_targets.update(targets)
+                    result_check = self._step_result_check(step_dict)
+                    if result_check.get("enabled") and result_check.get("target"):
+                        all_required_targets.update(
+                            self.engine.parse_step_text(result_check["target"])
+                            or [result_check["target"]]
+                        )
+                    group_final_config = step_dict.get("group_final_check")
+                    if isinstance(group_final_config, dict) and group_final_config.get("enabled"):
+                        for key in ("anchor", "expected", "wrong"):
+                            all_required_targets.update(self.engine.parse_step_text(
+                                str(group_final_config.get(key, "") or "")
+                            ))
                 # 2. 提取当前目标
                 if self.current_step_idx < len(self.process_steps):
                     current_step_dict = self.process_steps[self.current_step_idx]
                     required_targets = self._targets_for_step(current_step_dict)
-                # 3. 将所有涉及的 ID 添加进 YOLO 白名单
-                for t in all_required_targets:
-                    for option in self._target_options(t):
-                        if option in name_to_id and name_to_id[option] not in active_class_ids:
-                            active_class_ids.append(name_to_id[option])
+
+            # 独立状态/槽位监测不依赖线性工序，即使工序为空也必须激活相关类别。
+            monitor_expressions = (
+                self.toggle_state_monitor.required_target_expressions()
+                + self.slot_monitor.required_target_expressions()
+                + self.result_sequence_monitor.required_target_expressions()
+            )
+            for config in self.step_wiring_configs.values():
+                if not config.get("enabled"):
+                    continue
+                monitor_expressions.append(config.get("anchor_target", ""))
+                monitor_expressions.extend(config.get("connector_targets", []))
+            for expression in monitor_expressions:
+                all_required_targets.update(self.engine.parse_step_text(expression) or [])
+
+            # 将所有工序与持续监测涉及的 ID 添加进 YOLO 白名单。
+            for target in all_required_targets:
+                for option in self._target_options(target):
+                    class_id = name_to_id.get(option)
+                    if class_id is not None and class_id not in active_class_ids:
+                        active_class_ids.append(class_id)
+
+            # 派生关系的输出是虚拟标签，不能作为 YOLO class ID；真正需要送进
+            # YOLO 的是整体框和两个内部物体类别。
+            if self.derived_obb_tracker.enabled:
+                virtual_ids = {
+                    name_to_id[name]
+                    for name in self.derived_obb_tracker.virtual_outputs()
+                    if name in name_to_id
+                }
+                active_class_ids = [
+                    class_id for class_id in active_class_ids
+                    if class_id not in virtual_ids
+                ]
+                for class_name in self.derived_obb_tracker.required_yolo_classes():
+                    class_id = name_to_id.get(class_name)
+                    if class_id is not None and class_id not in active_class_ids:
+                        active_class_ids.append(class_id)
             # --- YOLO 推理 ---
             detections = []
             annotated_frame = frame.copy()
             if self.model is not None and len(active_class_ids) > 0:
-                infer_kwargs = dict(
-                    classes=active_class_ids,
-                    verbose=False,
-                    conf=self.current_conf,
-                    device=self.infer_device,
-                )
-                if self.yolo_imgsz is not None:
-                    infer_kwargs['imgsz'] = self.yolo_imgsz
+                infer_kwargs = self._build_infer_kwargs(active_class_ids)
                 try:
                     results = self.model(native_frame, **infer_kwargs)
                 except AssertionError as e:
@@ -1422,9 +3305,10 @@ class VisionThread(QThread):
                         results = self.model(native_frame, **infer_kwargs)
                     else:
                         raise
+                # 读取 Ultralytics 实际 letterbox 后送入模型的尺寸，而不是原视频尺寸。
+                self._update_yolo_input_size(native_frame)
                 if results and len(results) > 0:
                     names = self.model_names
-                    boxes_to_draw = []
                     native_h, native_w = native_frame.shape[:2]
                     # 1. 获取 UI 面板上真实勾选的 ID（真正要画出来的）
                     ui_checked_names = [self.model_names[cid] for cid in self.selected_class_ids if
@@ -1440,10 +3324,12 @@ class VisionThread(QThread):
                             conf = float(box.conf[0])
                             cls_name = names.get(cls_id, str(cls_id))
                             # 收集给后台引擎用的完整数据（无论有没有勾选）
-                            detections.append({'class': cls_name, 'bbox': draw_bbox})
-                            # 收集给前端画图用的数据（严格遵循勾选框，手套除外）
-                            if cls_name in ui_checked_names and cls_name not in ['glove', '手套']:
-                                boxes_to_draw.append((draw_bbox, cls_name, conf, 'aabb'))
+                            detections.append({
+                                'class': cls_name,
+                                'bbox': draw_bbox,
+                                'confidence': conf,
+                                '_class_id': cls_id,
+                            })
                     # 如果用了 OBB 旋转框模型
                     elif getattr(results[0], 'obb', None) is not None and len(results[0].obb) > 0:
                         for obb in results[0].obb:
@@ -1458,61 +3344,105 @@ class VisionThread(QThread):
                             ).astype(int)
                             conf = float(obb.conf[0])
                             cls_name = names.get(cls_id, str(cls_id))
-                            detections.append({'class': cls_name, 'bbox': draw_bbox})
+                            detections.append({
+                                'class': cls_name,
+                                'bbox': draw_bbox,
+                                'points': draw_points.tolist(),
+                                'confidence': conf,
+                                '_class_id': cls_id,
+                            })
 
-                            if cls_name in ui_checked_names and cls_name not in ['glove', '手套']:
-                                boxes_to_draw.append((draw_points, cls_name, conf, 'obb'))
+                    detections = self._postprocess_model_detections(detections)
+                    boxes_to_draw = []
+                    for detection in detections:
+                        cls_name = detection["class"]
+                        if cls_name not in ui_checked_names or cls_name in ('glove', '手套'):
+                            continue
+                        cls_id = int(detection.get("_class_id", self.name_to_id_cache.get(cls_name, 0)))
+                        conf = float(detection.get("confidence", 0.0))
+                        if detection.get("points") is not None:
+                            box_data = np.asarray(detection["points"], dtype=np.int32).reshape(-1, 2)
+                            box_type = 'obb'
+                        else:
+                            box_data = detection["bbox"]
+                            box_type = 'aabb'
+                        boxes_to_draw.append((box_data, cls_name, conf, box_type, cls_id))
+
+                    derived_detections = self.derived_obb_tracker.update(detections)
+                    if derived_detections:
+                        detections.extend(derived_detections)
+                        if self.derived_obb_tracker.config.get("show_result", True):
+                            for derived in derived_detections:
+                                derived_points = np.asarray(
+                                    derived.get("points", []), dtype=np.int32
+                                ).reshape(-1, 2)
+                                if len(derived_points) >= 4:
+                                    box_data = derived_points
+                                    box_type = 'obb'
+                                else:
+                                    box_data = derived["bbox"]
+                                    box_type = 'aabb'
+                                derived_name = derived["class"]
+                                derived_color_id = (
+                                    7 if derived.get("relation_state") == "matched" else 0
+                                )
+                                boxes_to_draw.append((
+                                    box_data,
+                                    derived_name,
+                                    float(derived.get("confidence", 1.0)),
+                                    box_type,
+                                    derived_color_id,
+                                ))
 
                     # 夺回 UI 控制权：彻底抛弃 YOLO 自带的 .plot()
                     annotated_frame = frame.copy()
 
                     if not self.use_chinese_labels:
                         # 【路线 A：英文原版】用 OpenCV 画干净的框
-                        for box_data, eng_name, conf, box_type in boxes_to_draw:
+                        for box_data, eng_name, conf, box_type, cls_id in boxes_to_draw:
+                            rgb_color = detection_class_color_rgb(cls_id, eng_name)
+                            cv_color = (rgb_color[2], rgb_color[1], rgb_color[0])
                             if box_type == 'aabb':
                                 x1, y1, x2, y2 = map(int, box_data)
-                                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), cv_color, 2)
                                 text_x, text_y = x1, max(0, y1 - 10)
                             else:
                                 # 🌟 画斜框 (多边形)
-                                cv2.polylines(annotated_frame, [box_data], isClosed=True, color=(0, 255, 0),
+                                cv2.polylines(annotated_frame, [box_data], isClosed=True, color=cv_color,
                                               thickness=2)
                                 # 找最上面的一个点作为文字的基准点
                                 top_pt = min(box_data, key=lambda p: p[1])
                                 text_x, text_y = top_pt[0], max(0, top_pt[1] - 10)
 
                             cv2.putText(annotated_frame, f"{eng_name} {conf:.2f}", (text_x, text_y),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, cv_color, 2)
                     else:
-                        # 【路线 B：中文特供版】Pillow 介入
-                        if boxes_to_draw:
-                            cv2_im_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                            pil_im = Image.fromarray(cv2_im_rgb)
-                            draw = ImageDraw.Draw(pil_im)
-                            font = self.font_label
-                            for box_data, eng_name, conf, box_type in boxes_to_draw:
-                                zh_name = self.engine.eng_to_zh.get(eng_name, eng_name)
-                                display_text = f"{zh_name} {conf:.2f}"
+                        # 【路线 B：中文优化版】OpenCV 画框，只用 Pillow 缓存小块中文字。
+                        for box_data, eng_name, conf, box_type, cls_id in boxes_to_draw:
+                            zh_name = self.engine.eng_to_zh.get(eng_name, eng_name)
+                            display_text = f"{zh_name} {conf:.2f}"
+                            rgb_color = detection_class_color_rgb(cls_id, eng_name)
+                            cv_color = (rgb_color[2], rgb_color[1], rgb_color[0])
 
-                                if box_type == 'aabb':
-                                    x1, y1, x2, y2 = map(int, box_data)
-                                    draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
-                                    text_x, text_y = x1, max(0, y1 - 45)
-                                else:
-                                    # 🌟 画斜框 (Pillow 多边形)
-                                    poly_pts = [tuple(pt) for pt in box_data]
-                                    draw.polygon(poly_pts, outline=(0, 255, 0), width=3)
-                                    top_pt = min(poly_pts, key=lambda p: p[1])
-                                    text_x, text_y = top_pt[0], max(0, top_pt[1] - 45)
+                            if box_type == 'aabb':
+                                x1, y1, x2, y2 = map(int, box_data)
+                                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), cv_color, 3)
+                                text_x, box_top = x1, y1
+                            else:
+                                cv2.polylines(
+                                    annotated_frame, [box_data], isClosed=True,
+                                    color=cv_color, thickness=3,
+                                )
+                                top_pt = min(box_data, key=lambda point: point[1])
+                                text_x, box_top = int(top_pt[0]), int(top_pt[1])
 
-                                try:
-                                    text_bbox = draw.textbbox((text_x, text_y), display_text, font=font)
-                                    draw.rectangle(text_bbox, fill=(255, 255, 255))
-                                except AttributeError:
-                                    draw.rectangle([text_x, text_y, text_x + 180, text_y + 45], fill=(255, 255, 255))
-                                draw.text((text_x, text_y), display_text, font=font, fill=(255, 0, 0))
-
-                            annotated_frame = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
+                            text_patch = self._get_text_patch(
+                                display_text, rgb_color
+                            )
+                            text_y = max(0, box_top - text_patch[0].shape[0])
+                            self._paste_text_patch(
+                                annotated_frame, text_patch, text_x, text_y
+                            )
             # 🌟 3. 画盲区锁定框 (LOCKED)
             for zone in self.engine.blind_zones:
                 zx1, zy1, zx2, zy2 = map(int, zone)
@@ -1549,11 +3479,7 @@ class VisionThread(QThread):
                     if was_remediation_aoi:
                         self._exit_remediation_mode(f"补救步骤 {old_idx + 1} 已人工放行，已回到正常工序。")
                     else:
-                        if self._step_order_group(self.process_steps[old_idx]):
-                            self._remember_unordered_completion(old_idx)
-                            self._sync_current_idx_for_unordered_group(self._unordered_group_indices(old_idx))
-                        else:
-                            self.current_step_idx = old_idx + 1
+                        self._advance_completed_step_or_start_post_check(old_idx, detections)
                         self.current_sub_count = 0
                         self.aoi_state = None
                         self.aoi_step_idx = None
@@ -1568,7 +3494,9 @@ class VisionThread(QThread):
                     alert_msg = "⚠️ AOI 特征比对人工强制放行！"
                     self.aoi_update_signal.emit(0.0, '', False)
                     # 最后一步放行后自动进入下一轮
-                    if not was_remediation_aoi and self.current_step_idx >= len(self.process_steps):
+                    if (not was_remediation_aoi
+                            and not self.post_completion_check
+                            and self.current_step_idx >= len(self.process_steps)):
                         self._finish_and_restart_cycle()
                         alert_msg = "⚠️ AOI 强制放行，当前产品已完成，进入下一轮！"
                 self.aoi_force_signal = False
@@ -1585,12 +3513,42 @@ class VisionThread(QThread):
                 else:
                     alert_msg = self.remediation_status_msg or "无法进入补救状态。"
 
-            # 1. 违禁检查
+            # 1. 全局持续报警检查：违禁物、状态规则或槽位终态。
+            continuous_result = self._update_continuous_monitors(detections)
+            conditional_alarms = list(continuous_result.get("alarms", []))
+            conditional_alarm = conditional_alarms[0] if conditional_alarms else None
+            slot_alarm_msg = self._observed_slot_mismatch()
+            active_slot_step = self._active_slot_expectation_step()
+            slot_alarm_blocks = bool(
+                slot_alarm_msg
+                and (not active_slot_step
+                     or active_slot_step.get("slot_expectation_block", True))
+            )
             has_forbidden, fb_class = self.engine.check_forbidden(detections, self.forbidden_targets)
-            if has_forbidden:
-                self._set_forbidden_alarm(True)
-                zh_name = self.engine.eng_to_zh.get(fb_class, fb_class)
-                alert_msg = f"画面中检测到违禁项：【{zh_name}】！"
+            has_state_alarm, state_alarm_msg, state_alarm_idx = self._check_state_alarm(detections)
+            has_any_alarm = bool(
+                has_forbidden or has_state_alarm or conditional_alarm or slot_alarm_msg
+            )
+            has_blocking_alarm = bool(
+                has_forbidden or has_state_alarm or conditional_alarm or slot_alarm_blocks
+            )
+            if has_any_alarm:
+                alarm_buzzer = bool(
+                    has_forbidden
+                    or (has_state_alarm and self._state_alarm_uses_buzzer(state_alarm_idx))
+                    or (conditional_alarm and conditional_alarm.get("buzzer", True))
+                    or slot_alarm_msg
+                )
+                self._set_forbidden_alarm(True, buzzer=alarm_buzzer)
+                if has_forbidden:
+                    zh_name = self.engine.eng_to_zh.get(fb_class, fb_class)
+                    alert_msg = f"画面中检测到违禁项：【{zh_name}】！"
+                elif conditional_alarm:
+                    alert_msg = conditional_alarm.get("message", "状态条件报警！")
+                elif slot_alarm_msg:
+                    alert_msg = slot_alarm_msg
+                else:
+                    alert_msg = state_alarm_msg
             else:
                 self._set_forbidden_alarm(False)
                 # 2. 超时监控 (🌟 动态读取 step_timeout)
@@ -1607,7 +3565,7 @@ class VisionThread(QThread):
             # ==============================================================
             # 3. 工序流转与循环
             # ==============================================================
-            if not has_forbidden:
+            if not has_blocking_alarm:
                 if self.remediation_mode and self.aoi_state is None:
                     rem_idx = self.remediation_step_idx
                     if rem_idx is None or rem_idx >= len(self.process_steps):
@@ -1679,19 +3637,14 @@ class VisionThread(QThread):
                                     self._record_aoi_status(passed_idx, 'passed', sim, threshold, best_angle)
                                     self.step_progress_by_idx[passed_idx] = 100
                                     self._clear_step_runtime_flags(passed_idx)
-                                    is_unordered_aoi = bool(self._step_order_group(self.process_steps[passed_idx]))
                                     if was_remediation_aoi:
                                         self.ng_tracker.mark_step_remedied(passed_idx)
                                         finished_group = False
                                     else:
                                         self.ng_tracker.mark_step_completed(passed_idx)
-                                        if is_unordered_aoi:
-                                            self._remember_unordered_completion(passed_idx)
-                                            group_indices = self._unordered_group_indices(passed_idx)
-                                            finished_group = self._sync_current_idx_for_unordered_group(group_indices)
-                                        else:
-                                            self.current_step_idx = passed_idx + 1
-                                            finished_group = False
+                                        finished_group = self._advance_completed_step_or_start_post_check(
+                                            passed_idx, detections
+                                        )
                                     self.current_sub_count = 0
                                     self.aoi_state = None
                                     self.aoi_step_idx = None
@@ -1730,7 +3683,9 @@ class VisionThread(QThread):
                                         self.ng_tracker._check_and_restore_ok()
                                         alert_msg = f"✅ AOI 特征比对通过! (相似度: {sim:.2%})"
                                     # 最后一步完成 → 延迟到闪烁结束后再重启，让用户看到通过提示
-                                    if not was_remediation_aoi and self.current_step_idx >= len(self.process_steps):
+                                    if (not was_remediation_aoi
+                                            and not self.post_completion_check
+                                            and self.current_step_idx >= len(self.process_steps)):
                                         self.aoi_pending_restart = True
                                         alert_msg = f"✅ AOI 特征比对通过! 所有步骤已完成，即将进入下一轮！"
                                     elif not was_remediation_aoi and finished_group:
@@ -1818,7 +3773,17 @@ class VisionThread(QThread):
                 else:
                     # 👇 原来正常的流转逻辑，整体往右缩进一格，放在 else 里面
                     if self.process_steps and self.current_step_idx < len(self.process_steps):
-                        group_indices = self._unordered_group_indices(self.current_step_idx)
+                        handled_post_check = False
+                        if self.post_completion_check:
+                            handled_post_check = True
+                            _, post_check_msg = self._evaluate_post_completion_check(detections)
+                            progress = 100
+                            if post_check_msg and not alert_msg:
+                                alert_msg = post_check_msg
+                        group_indices = (
+                            [] if handled_post_check
+                            else self._unordered_group_indices(self.current_step_idx)
+                        )
                         if group_indices:
                             finished_group, group_progress, group_alert = self._evaluate_unordered_group(detections)
                             progress = group_progress
@@ -1828,7 +3793,7 @@ class VisionThread(QThread):
                                 self.current_sub_count = 0
                                 self.engine.reset()
                                 self.step_start_time = time.time()
-                        else:
+                        elif not handled_post_check:
                             current_step_dict = self.process_steps[self.current_step_idx]
                             req_count = current_step_dict.get("count", 1)
 
@@ -1844,12 +3809,17 @@ class VisionThread(QThread):
                                 self.is_pausing = True
                                 self.pause_start_time = time.time()
 
-                            # 3. 状态机：暂停 1.5 秒后，正式进入下一步
+                            # 3. 状态机：按本步骤配置的确认时长停留后，正式进入下一步
                             if self.is_pausing:
-                                if time.time() - self.pause_start_time > 1.5:
+                                completion_hold_seconds = self._step_completion_hold_seconds(
+                                    current_step_dict
+                                )
+                                if time.time() - self.pause_start_time >= completion_hold_seconds:
                                     self.is_pausing = False
                                     self.current_sub_count += 1
                                     self.engine.reset()  # 清空动作引擎记忆
+                                    self.step_post_action_latched.discard(self.current_step_idx)
+                                    self.step_result_hit_counts.pop(self.current_step_idx, None)
                                     self._reset_jump_monitors()
 
                                     # 检查子次数是否全部达标
@@ -1861,13 +3831,18 @@ class VisionThread(QThread):
                                             # 进入 AOI 特征比对状态，不立即推进步骤
                                             self._start_aoi_check(self.current_step_idx, aoi_cfg)
                                         else:
-                                            self.ng_tracker.on_step_advance(self.current_step_idx, 'completed')
-                                            self.step_progress_by_idx[self.current_step_idx] = 100
-                                            self._clear_step_runtime_flags(self.current_step_idx)
+                                            completed_idx = self.current_step_idx
+                                            self.ng_tracker.on_step_advance(completed_idx, 'completed')
+                                            self.step_progress_by_idx[completed_idx] = 100
+                                            self._clear_step_runtime_flags(completed_idx)
                                             self._clear_restart_guard()
-                                            self.current_step_idx += 1
+                                            product_complete = (
+                                                self._advance_completed_step_or_start_post_check(
+                                                    completed_idx, detections
+                                                )
+                                            )
                                             # 最后一步完成后自动进入下一轮
-                                            if self.current_step_idx >= len(self.process_steps):
+                                            if product_complete and not self.post_completion_check:
                                                 self._finish_and_restart_cycle()
                                         self.current_sub_count = 0
                                     else:
@@ -1909,8 +3884,13 @@ class VisionThread(QThread):
                 frame,detections, required_targets, progress, self.is_pausing, current_step_text,
                 self.engine.eng_to_zh
             )
-            # 2. 错误装配、前置未完成时的“接近预警”与正式跳步分开计算。
-            # 错误装配和预警只提示，不推进工序、不记 NG；正式跳步仍由原监控器处理。
+            # 2. 组终态、错误装配、接近预警与正式跳步分开计算。
+            # 组终态/错误装配/预警只提示，不推进工序、不记 NG。
+            new_group_final_alarm, group_final_msg, group_final_key = (
+                self._check_pending_group_final_checks(detections)
+            )
+            if new_group_final_alarm:
+                self._flash_red_alarm(group_final_key)
             if self.just_restarted_cycle or self.remediation_mode or self.aoi_state is not None:
                 self.workflow_monitor.clear_prewarning_runtime()
                 self.wrong_pair_counters.clear()
@@ -1927,6 +3907,21 @@ class VisionThread(QThread):
                     detections, self.process_steps, self.current_step_idx, held_objs,
                     completed_step_indices=self._completed_step_indices()
                 )
+
+            jump_suspicions = []
+            if self.show_jump_progress and not is_jump:
+                for suspected_idx, suspected_progress in sorted(
+                    self.workflow_monitor.shadow_progress_by_idx.items()
+                ):
+                    if (
+                        suspected_idx != self.current_step_idx
+                        and 0 <= suspected_idx < len(self.process_steps)
+                        and self._step_record_status(suspected_idx) == "pending"
+                        and int(suspected_progress or 0) > 0
+                    ):
+                        jump_suspicions.append(
+                            (suspected_idx, int(suspected_progress))
+                        )
 
             if is_wrong_pair:
                 self._flash_red_alarm(f"wrong_pair_{wrong_pair_step_idx}")
@@ -1959,32 +3954,49 @@ class VisionThread(QThread):
                 cv2.rectangle(annotated_frame, (15, 15), (img_w - 15, img_h - 15), border_color, 20)
                 cv2.putText(annotated_frame, "CAUTION: EARLY ACTION!", (40, 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.8, border_color, 5, cv2.LINE_AA)
+            elif group_final_msg:
+                alert_msg = group_final_msg
+                img_h, img_w = annotated_frame.shape[:2]
+                border_color = (0, 0, 255) if fps_frame_count % 4 < 2 else (0, 128, 255)
+                cv2.rectangle(annotated_frame, (15, 15), (img_w - 15, img_h - 15), border_color, 20)
+                cv2.putText(annotated_frame, "WARNING: GROUP FINAL STATE!", (40, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, border_color, 5, cv2.LINE_AA)
+            elif jump_suspicions and not alert_msg:
+                suspicion_text = "、".join(
+                    f"步骤 {idx + 1}「{self.process_steps[idx].get('text', '')}」"
+                    f"[{suspected_progress}%]"
+                    for idx, suspected_progress in jump_suspicions[:3]
+                )
+                if len(jump_suspicions) > 3:
+                    suspicion_text += f"等 {len(jump_suspicions)} 步"
+                alert_msg = (
+                    f"🔎 疑似正在执行：{suspicion_text}，请确认是否发生跳步"
+                )
 
             # 🌟🌟🌟 修复：将缩进向左退一格，使其与 if is_jump 平级！
             # 3. 循环画出所有的手/手套和悬浮文字
             if hand_renders:
-                # 强制走 Pillow 以确保中文不会变问号
-                cv2_im_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                pil_im = Image.fromarray(cv2_im_rgb)
-                draw = ImageDraw.Draw(pil_im)
-                font_hand = self.font_hand
-
                 for render_box, hand_color, hand_text, box_type, landmarks, hand_id in hand_renders:
-                    # 先画原有的外框和文字
+                    cv_color = (hand_color[2], hand_color[1], hand_color[0])
                     if box_type == 'aabb':
                         hx1, hy1, hx2, hy2 = map(int, render_box)
-                        draw.rectangle([hx1, hy1, hx2, hy2], outline=hand_color, width=4)
-                        text_y = max(0, hy1 - 40)
-                        draw.text((hx1, text_y), hand_text, font=font_hand, fill=hand_color)
+                        cv2.rectangle(annotated_frame, (hx1, hy1), (hx2, hy2), cv_color, 4)
+                        text_x, box_top = hx1, hy1
                     else:
-                        poly_pts = [tuple(pt) for pt in render_box]
-                        draw.polygon(poly_pts, outline=hand_color, width=4)
-                        top_pt = min(poly_pts, key=lambda p: p[1])
-                        text_x, text_y = top_pt[0], max(0, top_pt[1] - 40)
-                        draw.text((text_x, text_y), hand_text, font=font_hand, fill=hand_color)
+                        cv2.polylines(
+                            annotated_frame, [render_box], isClosed=True,
+                            color=cv_color, thickness=4,
+                        )
+                        top_pt = min(render_box, key=lambda point: point[1])
+                        text_x, box_top = int(top_pt[0]), int(top_pt[1])
 
-                    # OpenCV 和 Pillow 转换完成后，再用 OpenCV 画骨架
-                annotated_frame = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
+                    text_patch = self._get_text_patch(
+                        hand_text, hand_color, font=self.font_hand
+                    )
+                    text_y = max(0, box_top - text_patch[0].shape[0])
+                    self._paste_text_patch(
+                        annotated_frame, text_patch, text_x, text_y
+                    )
 
                 # 🌟 重新遍历一次，专门画骨骼
                 for _, _, _, _, landmarks, _ in hand_renders:
@@ -1994,14 +4006,6 @@ class VisionThread(QThread):
                             mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
                             mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2)
                         )
-            else:
-                for hand_box, hand_color, hand_text, _, _, _ in hand_renders:
-                    hx1, hy1, hx2, hy2 = map(int, hand_box)
-                    # OpenCV 用 BGR，需翻转 RGB 颜色防变蓝
-                    cv_color = (hand_color[2], hand_color[1], hand_color[0])
-                    cv2.rectangle(annotated_frame, (hx1, hy1), (hx2, hy2), cv_color, 3)
-                    cv2.putText(annotated_frame, hand_text, (hx1, max(0, hy1 - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, cv_color, 2)
             # ==============================================================
             # 🌟🌟🌟 新增代码结束 🌟🌟🌟
             # 🌟 在左上角绘制当前帧率
@@ -2010,6 +4014,18 @@ class VisionThread(QThread):
             frame_h, frame_w = raw_frame.shape[:2]
             cv2.putText(annotated_frame, f"RES: {frame_w}x{frame_h}", (20, 100 if not is_jump else 200),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
+            if self.yolo_input_size:
+                yolo_input_w, yolo_input_h = self.yolo_input_size
+                cv2.putText(
+                    annotated_frame,
+                    f"YOLO IN: {yolo_input_w}x{yolo_input_h}",
+                    (20, 140 if not is_jump else 240),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (0, 215, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
             # ==============================================================
             # 🌟🌟🌟 新增：2K 拍照与录像模块 (在缩放前处理，保证原画质！) 🌟🌟🌟
             # ==============================================================
@@ -2062,6 +4078,17 @@ class VisionThread(QThread):
                     # (由于这里是子线程，千万不要直接在这里写 QMessageBox)
                     self.req_aoi_capture = False
                     self._aoi_capture_anchor = None
+
+            # 报警追溯录像独立于手动录像：视频内叠加工序/进度/产品状态，
+            # 同目录 JSON 保存可检索的上下文时间线。
+            try:
+                alarm_context = self._build_alarm_record_context(alert_msg, progress)
+                self._update_alarm_clip(
+                    time.time(), annotated_frame, alarm_context, alert_msg, current_fps
+                )
+            except Exception as exc:
+                print(f"[AlarmRecording] 帧处理失败: {exc}")
+                self._finish_alarm_clip("recording_error")
 
             # 2. 录像状态机控制
             if self.req_record_action == 'start':
@@ -2147,6 +4174,9 @@ class VisionThread(QThread):
         self._safe_release_capture(cap)
         self.running = False
         self._finish_recording()
+        self._finish_alarm_clip("stream_stopped")
+        self._alarm_frame_buffer.clear()
+        self._alarm_last_buffered_ts = 0.0
         self._reset_transient_requests()
         self.aoi_update_signal.emit(0.0, '', False)
     def stop(self):
@@ -2169,6 +4199,7 @@ class RecordingDialog(QDialog):
         self._user_stopped = False  # 用户主动停止录制，关闭时不需要再问
         self.setup_ui()
         self.vision_thread.recording_time_signal.connect(self._on_rec_time)
+        self.vision_thread.alarm_clip_saved_signal.connect(self._on_alarm_clip_saved)
 
     def setup_ui(self):
         layout = QVBoxLayout()
@@ -2219,7 +4250,47 @@ class RecordingDialog(QDialog):
         hint.setAlignment(Qt.AlignCenter)
         layout.addWidget(hint)
 
+        alarm_group = QGroupBox("🚨 报警追溯录像")
+        alarm_layout = QVBoxLayout(alarm_group)
+        self.chk_alarm_clip = QCheckBox(
+            "报警时自动保存前 5 秒 + 后 5 秒（含工序信息）"
+        )
+        self.chk_alarm_clip.setChecked(bool(self.vision_thread.alarm_clip_enabled))
+        self.chk_alarm_clip.stateChanged.connect(self._toggle_alarm_clip)
+        alarm_layout.addWidget(self.chk_alarm_clip)
+        alarm_note = QLabel(
+            "录像左上角会显示方案、产品、当前工序、进度和报警原因；"
+            "同时生成 JSON 工序时间线。"
+        )
+        alarm_note.setWordWrap(True)
+        alarm_note.setStyleSheet("color:#5f6368; font-size:12px;")
+        alarm_layout.addWidget(alarm_note)
+        alarm_row = QHBoxLayout()
+        self.lbl_alarm_clip = QLabel("尚未生成报警录像")
+        self.lbl_alarm_clip.setStyleSheet("color:#6c757d; font-size:12px;")
+        self.btn_open_alarm_folder = QPushButton("📂 打开报警录像目录")
+        self.btn_open_alarm_folder.clicked.connect(self._open_alarm_folder)
+        alarm_row.addWidget(self.lbl_alarm_clip, stretch=1)
+        alarm_row.addWidget(self.btn_open_alarm_folder)
+        alarm_layout.addLayout(alarm_row)
+        layout.addWidget(alarm_group)
+
         self.setLayout(layout)
+
+    def _toggle_alarm_clip(self, state):
+        self.vision_thread.alarm_clip_enabled = bool(state)
+
+    def _open_alarm_folder(self):
+        folder = os.path.abspath(self.vision_thread.alarm_clip_root)
+        os.makedirs(folder, exist_ok=True)
+        try:
+            os.startfile(folder)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法打开目录", str(exc))
+
+    def _on_alarm_clip_saved(self, video_path):
+        self.lbl_alarm_clip.setText(f"已保存：{os.path.basename(video_path)}")
+        self.lbl_alarm_clip.setToolTip(video_path)
 
     def _take_photo(self):
         if not self.vision_thread.isRunning():
@@ -2301,6 +4372,10 @@ class RecordingDialog(QDialog):
             self.vision_thread.recording_time_signal.disconnect(self._on_rec_time)
         except TypeError:
             pass  # 已经断开过了
+        try:
+            self.vision_thread.alarm_clip_saved_signal.disconnect(self._on_alarm_clip_saved)
+        except TypeError:
+            pass
         event.accept()
 
 
@@ -2955,16 +5030,42 @@ class MainTesterApp(QMainWindow):
         conf_layout.addWidget(QLabel("🎚️ YOLO 置信度:"))
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setRange(1, 100)
-        self.conf_slider.setValue(80)
+        self.conf_slider.setValue(25)
         self.conf_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.conf_slider.setTickInterval(10)
         self.conf_slider.valueChanged.connect(self.on_conf_slider_changed)
-        self.conf_label = QLabel("0.80")
+        self.conf_label = QLabel("0.25")
         self.conf_label.setFixedWidth(40)
         self.conf_label.setStyleSheet("font-weight: bold;")
         conf_layout.addWidget(self.conf_slider)
         conf_layout.addWidget(self.conf_label)
         filter_outer_layout.addLayout(conf_layout)
+
+        detection_filter_layout = QHBoxLayout()
+        self.btn_same_class_box_filter = QPushButton("同类框去重/稳定：关")
+        self.btn_same_class_box_filter.setCheckable(True)
+        self.btn_same_class_box_filter.setChecked(False)
+        self.btn_same_class_box_filter.setToolTip(
+            "默认关闭。开启后只处理高度重叠的同类别框：压掉低置信度重复框，"
+            "并对连续帧位置做轻量平滑；彼此分开的同类物体不会合并。"
+        )
+        self.btn_same_class_box_filter.toggled.connect(self.toggle_same_class_box_filter)
+        self.btn_cross_class_box_filter = QPushButton("异类框互斥：关")
+        self.btn_cross_class_box_filter.setCheckable(True)
+        self.btn_cross_class_box_filter.setChecked(False)
+        self.btn_cross_class_box_filter.setToolTip(
+            "默认关闭。开启后，同一位置高度重叠但类别不同的框只保留置信度最高者。"
+            "它用于缓解一个物体同时显示多个类别，根治仍需补充并纠正训练数据。"
+        )
+        self.btn_cross_class_box_filter.toggled.connect(self.toggle_cross_class_box_filter)
+        detection_filter_layout.addWidget(self.btn_same_class_box_filter)
+        detection_filter_layout.addWidget(self.btn_cross_class_box_filter)
+        filter_outer_layout.addLayout(detection_filter_layout)
+        detection_filter_note = QLabel("两个功能默认关闭；关闭时推理参数和检测结果保持原样。")
+        detection_filter_note.setStyleSheet("color:#5f6368;")
+        detection_filter_note.setWordWrap(True)
+        filter_outer_layout.addWidget(detection_filter_note)
+        self._refresh_detection_filter_buttons()
 
         self.filter_group.setLayout(filter_outer_layout)
         control_layout.addWidget(self.filter_group)
@@ -2986,7 +5087,11 @@ class MainTesterApp(QMainWindow):
         cam_row1.addWidget(QLabel("分辨率:"))
         self.combo_capture_res = QComboBox()
         self.combo_capture_res.addItems(["1280×720", "1920×1080", "2560×1440", "3840×2160 (4K)"])
-        self.combo_capture_res.setCurrentIndex(0)  # 默认 1280×720
+        self.combo_capture_res.setCurrentIndex(1)  # 默认 1920×1080
+        self.combo_capture_res.setToolTip(
+            "采集分辨率在打开摄像头时应用；切换后请停止并重新打开摄像头。"
+            "摄像头不支持该档位时，驱动可能回退到最接近的分辨率。"
+        )
         cam_row1.addWidget(self.combo_capture_res, stretch=2)
         c_layout.addLayout(cam_row1)
 
@@ -3007,10 +5112,13 @@ class MainTesterApp(QMainWindow):
         # YOLO 输入尺寸 + 视频导入
         cam_row2.addWidget(QLabel("YOLO:"))
         self.combo_yolo_imgsz = QComboBox()
-        self.combo_yolo_imgsz.addItems(["默认 (原生)", "640", "960", "1280"])
-        self.combo_yolo_imgsz.setCurrentIndex(0)  # 默认使用模型原生分辨率
+        self.combo_yolo_imgsz.addItems(["默认 (通常640)", "640", "960", "1088", "1280"])
+        self.combo_yolo_imgsz.setCurrentText("1280")
         self.combo_yolo_imgsz.setEditable(True)
-        self.combo_yolo_imgsz.setToolTip("YOLO 推理分辨率，「默认」使用模型训练时的原生尺寸")
+        self.combo_yolo_imgsz.setToolTip(
+            "YOLO 推理输入尺寸（长边约束并保持画面比例后补边）。"
+            "“默认”表示使用 Ultralytics 框架默认值，通常是 640，并不等于训练图片或摄像头的原始分辨率。"
+        )
         cam_row2.addWidget(self.combo_yolo_imgsz)
 
         self.btn_vid = QPushButton("导入视频文件")
@@ -3074,6 +5182,47 @@ class MainTesterApp(QMainWindow):
         conf = value / 100.0
         self.conf_label.setText(f"{conf:.2f}")
         self.vision_thread.current_conf = conf
+
+    @staticmethod
+    def _style_detection_filter_button(button, enabled, enabled_text, disabled_text):
+        button.setText(enabled_text if enabled else disabled_text)
+        button.setStyleSheet(
+            "background:#188038; color:white; font-weight:bold; padding:6px;"
+            if enabled else
+            "background:#f1f3f4; color:#3c4043; padding:6px;"
+        )
+
+    def _refresh_detection_filter_buttons(self):
+        if hasattr(self, "btn_same_class_box_filter"):
+            self._style_detection_filter_button(
+                self.btn_same_class_box_filter,
+                self.btn_same_class_box_filter.isChecked(),
+                "同类框去重/稳定：开",
+                "同类框去重/稳定：关",
+            )
+        if hasattr(self, "btn_cross_class_box_filter"):
+            self._style_detection_filter_button(
+                self.btn_cross_class_box_filter,
+                self.btn_cross_class_box_filter.isChecked(),
+                "异类框互斥：开",
+                "异类框互斥：关",
+            )
+
+    def toggle_same_class_box_filter(self, enabled):
+        enabled = bool(enabled)
+        self.vision_thread.same_class_box_filter_enabled = enabled
+        self.vision_thread.reset_detection_postprocessing()
+        self._refresh_detection_filter_buttons()
+        state = "已开启" if enabled else "已关闭（原始识别）"
+        self.status_banner.append(f"<div style='color:#1a73e8;'>🎯 同类框去重/稳定: {state}</div>")
+
+    def toggle_cross_class_box_filter(self, enabled):
+        enabled = bool(enabled)
+        self.vision_thread.cross_class_box_filter_enabled = enabled
+        self.vision_thread.reset_detection_postprocessing()
+        self._refresh_detection_filter_buttons()
+        state = "已开启" if enabled else "已关闭（原始识别）"
+        self.status_banner.append(f"<div style='color:#1a73e8;'>🎯 异类框互斥: {state}</div>")
 
     def on_frame_transform_changed(self):
         self.vision_thread.frame_transform = self.combo_frame_transform.currentData() or "none"
@@ -3901,6 +6050,30 @@ class MainTesterApp(QMainWindow):
                 profile_data = data["profiles"][profile_name]
                 data["process_steps"] = profile_data.get("process_steps", [])
                 data["forbidden_items"] = profile_data.get("forbidden_items", "")
+                data["state_alarm_rules"] = profile_data.get(
+                    "state_alarm_rules", process_editor.DEFAULT_STATE_ALARM_RULES
+                )
+                data["state_alarm_confirm_frames"] = profile_data.get(
+                    "state_alarm_confirm_frames", process_editor.DEFAULT_STATE_ALARM_CONFIRM_FRAMES
+                )
+                data["state_alarm_release_frames"] = profile_data.get(
+                    "state_alarm_release_frames", process_editor.DEFAULT_STATE_ALARM_RELEASE_FRAMES
+                )
+                data["state_alarm_padding_ratio"] = profile_data.get(
+                    "state_alarm_padding_ratio", process_editor.DEFAULT_STATE_ALARM_PADDING_RATIO
+                )
+                data["toggle_state_monitors"] = profile_data.get(
+                    "toggle_state_monitors", process_editor.DEFAULT_TOGGLE_STATE_MONITORS
+                )
+                data["state_conditional_rules"] = profile_data.get(
+                    "state_conditional_rules", process_editor.DEFAULT_STATE_CONDITIONAL_RULES
+                )
+                data["slot_monitors"] = profile_data.get(
+                    "slot_monitors", process_editor.DEFAULT_SLOT_MONITORS
+                )
+                data["result_monitor_stages"] = profile_data.get(
+                    "result_monitor_stages", process_editor.DEFAULT_RESULT_MONITOR_STAGES
+                )
                 data["step_timeout"] = profile_data.get("step_timeout", process_editor.DEFAULT_STEP_TIMEOUT)
                 data["jump_monitor_scope"] = profile_data.get(
                     "jump_monitor_scope", process_editor.DEFAULT_JUMP_MONITOR_SCOPE
@@ -3914,15 +6087,27 @@ class MainTesterApp(QMainWindow):
                 data["jump_ignore_static_intersection"] = profile_data.get(
                     "jump_ignore_static_intersection", process_editor.DEFAULT_JUMP_IGNORE_STATIC_INTERSECTION
                 )
+                data["jump_progress_visible"] = profile_data.get(
+                    "jump_progress_visible", process_editor.DEFAULT_JUMP_PROGRESS_VISIBLE
+                )
             else:
                 # 即使没有工序，也给个空壳，保证不出错
                 data["process_steps"] = []
                 data["forbidden_items"] = ""
+                data["state_alarm_rules"] = process_editor.DEFAULT_STATE_ALARM_RULES
+                data["state_alarm_confirm_frames"] = process_editor.DEFAULT_STATE_ALARM_CONFIRM_FRAMES
+                data["state_alarm_release_frames"] = process_editor.DEFAULT_STATE_ALARM_RELEASE_FRAMES
+                data["state_alarm_padding_ratio"] = process_editor.DEFAULT_STATE_ALARM_PADDING_RATIO
+                data["toggle_state_monitors"] = process_editor.DEFAULT_TOGGLE_STATE_MONITORS
+                data["state_conditional_rules"] = process_editor.DEFAULT_STATE_CONDITIONAL_RULES
+                data["slot_monitors"] = process_editor.DEFAULT_SLOT_MONITORS
+                data["result_monitor_stages"] = process_editor.DEFAULT_RESULT_MONITOR_STAGES
                 data["step_timeout"] = process_editor.DEFAULT_STEP_TIMEOUT
                 data["jump_monitor_scope"] = process_editor.DEFAULT_JUMP_MONITOR_SCOPE
                 data["jump_strong_action_enabled"] = process_editor.DEFAULT_JUMP_STRONG_ACTION_ENABLED
                 data["jump_strong_action_frames"] = process_editor.DEFAULT_JUMP_STRONG_ACTION_FRAMES
                 data["jump_ignore_static_intersection"] = process_editor.DEFAULT_JUMP_IGNORE_STATIC_INTERSECTION
+                data["jump_progress_visible"] = process_editor.DEFAULT_JUMP_PROGRESS_VISIBLE
 
             # 👇 先通知 NG 追踪器切换到当前方案的数据隔离区，避免新方案产品记到旧方案里
             if profile_name:
@@ -4041,9 +6226,15 @@ class MainTesterApp(QMainWindow):
             base = base or status.get("base_name", "")
             if not removed and not base:
                 return ""
+            missing_text = ""
+            if bool(step_dict.get("detach_missing_enabled", False)):
+                missing_frames = int(step_dict.get("detach_missing_frames", 30) or 30)
+                missing_padding = float(step_dict.get("detach_missing_padding_ratio", 0.15) or 0.0)
+                missing_text = f" / 消失判定: {missing_frames}帧, 外扩{missing_padding:.2f}"
             return (
                 " <span style='background-color:#eef5ff; color:#1a73e8; padding:2px 8px; "
-                f"border-radius:4px; font-size: 14px;'>拆除物: {removed or '-'} / 基准物: {base or '-'}</span>"
+                f"border-radius:4px; font-size: 14px;'>拆除物: {removed or '-'} / 基准物: {base or '-'}"
+                f"{missing_text}</span>"
             )
 
         def detach_hint_html(step_dict, original_idx):
@@ -4054,13 +6245,19 @@ class MainTesterApp(QMainWindow):
                 return detach_config_html(step_dict)
             state = status.get("state", "missing")
             if state == "detached":
-                bg, text = "#28a745", "当前状态：已拆除"
+                evidence = status.get("evidence")
+                text = "当前状态：已拆除（消失确认）" if evidence == "disappearance" else "当前状态：已拆除"
+                bg = "#28a745"
             elif state == "waiting_assembly":
                 bg, text = "#6c757d", "当前状态：等待前置装配"
             elif state == "attached":
                 bg, text = "#1a73e8", "当前状态：已贴合，等待分离"
             elif state == "separating":
                 bg, text = "#ff8c00", "当前状态：分离中"
+            elif state == "disappearing":
+                frames = int(status.get("missing_frames", 0) or 0)
+                required = int(status.get("missing_required_frames", 30) or 30)
+                bg, text = "#ff8c00", f"当前状态：安装区已空 {frames}/{required}帧"
             elif state == "waiting_attach":
                 bg, text = "#6c757d", "当前状态：等待先贴合"
             elif state == "missing":
@@ -4109,7 +6306,7 @@ class MainTesterApp(QMainWindow):
                 bg = "#1a73e8"
             elif state == "waiting_hand":
                 text = (
-                    "空间关系已满足，等待手完成操作并离开"
+                    "空间关系已满足，但尚未识别到手触达目标"
                     if relation_progress >= 100 else "等待手进入当前工序操作区"
                 )
                 bg = "#6c757d"
@@ -4134,14 +6331,234 @@ class MainTesterApp(QMainWindow):
                 f"border-radius:4px; font-size: 15px;'>⛔ 等待前置步骤 {missing_text}</span>"
             )
 
+        def result_check_hint_html(step_dict):
+            status = step_dict.get("_result_check_status") or {}
+            if not status:
+                return ""
+            target = status.get("target", "")
+            hits = int(status.get("hits", 0) or 0)
+            required = int(status.get("required_hits", 0) or 0)
+            if status.get("satisfied"):
+                bg, text = "#188038", f"最终结果通过：{target}"
+            elif status.get("hand_in_zone"):
+                bg, text = "#ff8c00", "等待手离开后确认未识别状态"
+            elif status.get("condition_met"):
+                bg, text = "#1a73e8", f"最终结果确认中：{target} {hits}/{required}帧"
+            elif status.get("mode") == "absent":
+                bg, text = "#d93025", f"应为关闭状态，但仍识别到：{target}"
+            else:
+                bg, text = "#d93025", f"等待最终识别结果：{target}"
+            return (
+                f" <span style='background-color:{bg}; color:white; padding:2px 8px; "
+                f"border-radius:4px; font-size:15px;'>✅ {text}</span>"
+            )
+
+        state_statuses = list(getattr(self.vision_thread, "toggle_state_statuses", []) or [])
+        slot_statuses = list(getattr(self.vision_thread, "slot_monitor_statuses", []) or [])
+        sequence_statuses = list(
+            getattr(self.vision_thread, "result_sequence_statuses", []) or []
+        )
+        slot_expectation = dict(
+            getattr(self.vision_thread, "slot_expectation_status", {}) or {}
+        )
+        if state_statuses or slot_statuses or sequence_statuses:
+            html_content += (
+                "<div style='background:#f4f7fb; border:1px solid #c8d5e8; "
+                "border-radius:7px; padding:8px 10px; margin-bottom:10px;'>"
+                "<div style='color:#174a8b; font-weight:bold;'>📡 实时状态监测</div>"
+            )
+            phase_names = {
+                "ready": "就绪", "confirming_touch": "触发确认中",
+                "waiting_release": "等待离手", "waiting_ready": "等待初始离手",
+                "waiting_action": "等待本工序动作完成",
+                "waiting_completion": "等待工序先完成100%",
+                "waiting_group_actions": "等待乱序组全部动作完成",
+                "target_missing": "未看到触发目标", "monitoring": "稳定监测",
+                "operating": "操作遮挡中", "settling": "离手稳定中",
+                "calibrating": "学习接口位置", "waiting_anchor": "等待板子",
+                "invalid_anchor": "锚点无效", "waiting_targets": "等待线缆完整出现",
+                "confirming_order": "确认线缆顺序",
+                "waiting_change": "等待开始下一次换线", "waiting_result": "等待完整正确结果",
+                "wrong": "接线结果错误", "cycle_complete": "本块板子验收通过",
+            }
+            for status in state_statuses:
+                phase = phase_names.get(status.get("phase"), status.get("phase", ""))
+                html_content += (
+                    f"<div style='margin-top:3px;'><b>{status.get('name', '')}</b>："
+                    f"<span style='color:#d93025; font-weight:bold;'>{status.get('state', '')}</span>"
+                    f" <span style='color:#6b7280; font-size:13px;'>({phase}，已切换"
+                    f"{int(status.get('toggle_count', 0) or 0)}次)</span></div>"
+                )
+            for status in slot_statuses:
+                phase = phase_names.get(status.get("phase"), status.get("phase", ""))
+                if status.get("monitor_type") == "relative_order":
+                    order = status.get("actual_order") or status.get("visible_order") or []
+                    slot_text = "从左/上到右/下：" + (" → ".join(order) if order else "等待线缆")
+                else:
+                    slot_text = "；".join(
+                        f"{name}={value}" for name, value in (status.get("slots", {}) or {}).items()
+                    )
+                html_content += (
+                    f"<div style='margin-top:3px;'><b>{status.get('name', '')}</b>：{slot_text or '待学习'}"
+                    f" <span style='color:#6b7280; font-size:13px;'>({phase})</span></div>"
+                )
+                if status.get("configured") and status.get("step_idx") is not None:
+                    if status.get("phase") == "waiting_group_actions":
+                        color, result_text = (
+                            "#174a8b", "组内接线动作可任意顺序，全部完成后再验收最终接线结果"
+                        )
+                    elif status.get("phase") == "waiting_action":
+                        color, result_text = (
+                            "#174a8b", "先完成本步骤原有接线动作，完成后再验收接线结果"
+                        )
+                    elif status.get("satisfied"):
+                        color, result_text = "#188038", "当前步骤接线结果正确"
+                    elif status.get("settled") and status.get("mismatches"):
+                        color, result_text = "#d93025", "；".join(status.get("mismatches", []))
+                    else:
+                        color, result_text = "#b06000", "等待本步骤线缆完整出现并离手确认"
+                    html_content += (
+                        f"<div style='color:{color}; font-weight:bold; margin-left:12px;'>"
+                        f"↳ {result_text}</div>"
+                    )
+                if status.get("continuous_enabled"):
+                    if status.get("continuous_satisfied"):
+                        color, result_text = "#188038", "接线位置正确"
+                    elif status.get("continuous_settled") and status.get("continuous_mismatches"):
+                        color = "#d93025"
+                        result_text = "；".join(status.get("continuous_mismatches", []))
+                    else:
+                        color, result_text = "#b06000", "等待线缆完整出现并离手确认"
+                    html_content += (
+                        f"<div style='color:{color}; font-weight:bold; margin-left:12px;'>"
+                        f"↳ {result_text}</div>"
+                    )
+            for status in sequence_statuses:
+                phase = status.get("phase", "")
+                current = int(status.get("current_number", 0) or 0)
+                total = int(status.get("total_stages", 0) or 0)
+                expected_text = " → ".join(status.get("expected_order", []) or []) or "未配置"
+                observed_order = (
+                    status.get("actual_order")
+                    or status.get("visible_order")
+                    or status.get("live_order")
+                    or []
+                )
+                actual_text = " → ".join(observed_order) or "尚未纳入板子范围"
+                if phase == "cycle_complete":
+                    color = "#188038"
+                    detail = (
+                        f"✅ 本块板子全部通过（累计{int(status.get('cycle_count', 0) or 0)}块），"
+                        "移出当前板子后自动回到第1关"
+                    )
+                elif phase == "wrong":
+                    color = "#d93025"
+                    detail = f"❌ 当前：{actual_text}；正确应为：{expected_text}"
+                elif phase == "waiting_change":
+                    color = "#1a73e8"
+                    detail = f"上一关已通过，等待开始换线；本关目标：{expected_text}"
+                else:
+                    color = "#b06000"
+                    phase_text = phase_names.get(phase, phase)
+                    if phase == "waiting_targets":
+                        outside = list(status.get("outside_region_targets", []) or [])
+                        accepted = list(status.get("accepted_connector_targets", []) or [])
+                        required = int(status.get("required_connector_count", 0) or 0)
+                        if outside:
+                            detail = (
+                                f"目标：{expected_text}；画面已看到{'、'.join(outside)}，"
+                                "但它尚未接触板子监测范围"
+                            )
+                        else:
+                            detail = (
+                                f"目标：{expected_text}；已纳入板子范围 "
+                                f"{len(accepted)}/{required or len(status.get('expected_order', []) or [])} 根"
+                            )
+                    elif phase == "settling":
+                        clear_frames = int(status.get("hand_clear_frames", 0) or 0)
+                        clear_required = int(status.get("hand_clear_required", 0) or 0)
+                        detail = (
+                            f"当前：{actual_text}；等待离手确认 "
+                            f"{clear_frames}/{clear_required} 帧"
+                        )
+                    elif phase == "confirming_order":
+                        hits = int(status.get("order_hits", 0) or 0)
+                        required = int(status.get("order_required", 0) or 0)
+                        detail = (
+                            f"当前：{actual_text}；顺序稳定确认 "
+                            f"{hits}/{required} 帧"
+                        )
+                    else:
+                        detail = f"目标：{expected_text}；当前：{actual_text}（{phase_text}）"
+                html_content += (
+                    "<div style='border-top:1px solid #d7deea; margin-top:6px; padding-top:5px;'>"
+                    f"<b>🧪 {status.get('name', '')}　第{current}/{total}关："
+                    f"{status.get('stage_name', '')}</b>"
+                    f"<div style='color:{color}; font-weight:bold; margin-left:12px;'>{detail}</div>"
+                    "</div>"
+                )
+            if slot_expectation.get("configured"):
+                if slot_expectation.get("satisfied"):
+                    color, label = "#188038", "终态布局正确"
+                elif not slot_expectation.get("settled"):
+                    color, label = "#b06000", "等待离手后稳定验收"
+                else:
+                    expected = slot_expectation.get("expected", {}) or {}
+                    actual = slot_expectation.get("actual", {}) or {}
+                    observed_wrong = any(
+                        actual.get(name) not in (None, "", "空", "未知", "未知槽位")
+                        and actual.get(name) != target
+                        for name, target in expected.items()
+                    )
+                    if observed_wrong:
+                        color, label = "#d93025", "；".join(
+                            slot_expectation.get("mismatches", [])
+                        )
+                    else:
+                        color, label = "#b06000", "已离手，等待所有槽位达到目标终态"
+                html_content += (
+                    f"<div style='color:{color}; font-weight:bold; margin-top:4px;'>"
+                    f"🧩 当前步骤：{label}</div>"
+                )
+            html_content += "</div>"
+
+        post_check = dict(
+            getattr(self.vision_thread, "post_completion_check", {}) or {}
+        )
+        if post_check:
+            post_step_idx = int(post_check.get("step_idx", current_idx) or 0)
+            post_name = html.escape(str(post_check.get("name") or "附加条件验收"))
+            post_message = html.escape(str(
+                post_check.get("message") or "正在检查最终状态"
+            ))
+            post_progress = max(0, min(100, int(post_check.get("progress", 0) or 0)))
+            html_content += (
+                "<div style='background:#f5efff; border:2px solid #7e57c2; "
+                "border-radius:9px; padding:10px 12px; margin-bottom:10px;'>"
+                "<div style='color:#5e35b1; font-weight:bold; font-size:18px;'>"
+                f"🧪 独立附加条件验收　步骤 {post_step_idx + 1}</div>"
+                "<div style='color:#188038; font-weight:bold;'>"
+                "✅ 原工序动作已完成：100%</div>"
+                f"<div style='margin-top:4px;'><b>{post_name}</b></div>"
+                f"<div style='color:#5f6368;'>{post_message}</div>"
+                f"<div style='color:#5e35b1; font-weight:bold;'>验收进度：{post_progress}%</div>"
+                "</div>"
+            )
+
         if alert_msg and "AOI" not in alert_msg:
-            if "违禁" in alert_msg or "中断" in alert_msg or "失败" in alert_msg:
+            if any(keyword in alert_msg for keyword in (
+                "违禁", "中断", "失败", "状态违规", "布局错误", "禁止触碰",
+                "接线顺序错误", "接线结果错误"
+            )):
                 html_content += f"<div style='background-color: #dc3545; color: white; padding: 10px; border-radius: 5px; margin-bottom: 10px; font-weight: bold;'>⚠️ {alert_msg}</div>"
             else:
                 html_content += f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; margin-bottom: 10px; border: 1px solid #ffeeba;'>{alert_msg}</div>"
 
         if not process_steps:
-            html_content += "未配置任何工序步骤，仅开启自由过滤检测。"
+            if sequence_statuses:
+                html_content += "未配置普通动作工序，正在独立运行接线结果关卡。"
+            else:
+                html_content += "未配置任何工序步骤，仅开启自由过滤检测。"
         else:
             if current_idx >= len(process_steps):
                 if alert_msg and "AOI" in alert_msg and "通过" in alert_msg:
@@ -4156,6 +6573,9 @@ class MainTesterApp(QMainWindow):
                 original_step_num = step_dict.get("_display_step_num", i + 1)
                 original_idx = original_step_num - 1
                 row_progress = int(step_dict.get("_runtime_progress", 0) or 0)
+                jump_shadow_progress = int(
+                    step_dict.get("_jump_shadow_progress", 0) or 0
+                )
                 group_name = step_dict.get("_unordered_group", "")
                 aoi_state = step_dict.get("_aoi_state")
                 aoi_is_active = aoi_state in ("finding_anchor", "checking", "blocked")
@@ -4193,20 +6613,34 @@ class MainTesterApp(QMainWindow):
                         elif aoi_state:
                             aoi_hint = f" <span style='background-color:#17a2b8; color:white; padding:2px 8px; border-radius:4px; font-size: 14px;'>🔬 AOI {float(aoi_sim):.1%}/{float(aoi_threshold):.0%}</span>"
                     html_content += f"<div style='color: #28a745;'><b>✅ 步骤 {original_step_num}:</b> {step_text} <i>[{done_label}]</i>{order_hint}{aoi_hint}{detach_hint}</div>"
-                elif (is_current_runtime_step or row_progress > 0 or aoi_is_active
+                elif (is_current_runtime_step or row_progress > 0 or jump_shadow_progress > 0 or aoi_is_active
                       or remediation_active or step_dict.get("_unordered_active")):
-                    count_str = f" <b>[{sub_count}/{req_count}次]</b>" if req_count > 1 else ""
+                    count_str = (
+                        f" <b>[{sub_count}/{req_count}次]</b>"
+                        if req_count > 1 and is_current_runtime_step else ""
+                    )
 
                     if is_pausing and is_current_runtime_step:
                         detach_hint = detach_hint_html(step_dict, original_idx)
                         html_content += f"<div style='color: #155724; background-color: #d4edda; padding: 3px; border-radius: 5px;'><b>✅ 步骤 {original_step_num}:</b> {step_text}{count_str} <i>(结果确认中...)</i>{detach_hint}</div>"
                     else:
-                        shown_progress = row_progress if row_progress > 0 else (progress if is_current_runtime_step else 0)
-                        prog_text = f" [{shown_progress}%]" if shown_progress > 0 else ""
+                        shown_progress = (
+                            jump_shadow_progress
+                            if jump_shadow_progress > 0
+                            else row_progress if row_progress > 0
+                            else progress if is_current_runtime_step else 0
+                        )
+                        prog_text = (
+                            f" [疑似跳步 {shown_progress}%]"
+                            if jump_shadow_progress > 0
+                            else f" [{shown_progress}%]" if shown_progress > 0 else ""
+                        )
 
                         # 跳步警报提示
                         jump_hint = ""
-                        if is_current_runtime_step and alert_msg and "跳步" in alert_msg:
+                        if jump_shadow_progress > 0:
+                            jump_hint = " <span style='background-color:#ff8c00; color:white; padding:2px 6px; border-radius:4px; font-size: 16px;'>👀 跳步监测中</span>"
+                        elif is_current_runtime_step and alert_msg and "跳步" in alert_msg:
                             jump_hint = " <span style='background-color:#d93025; color:white; padding:2px 6px; border-radius:4px; font-size: 16px;'>⚠️ 请先完成该步骤</span>"
 
                         detach_hint = detach_hint_html(step_dict, original_idx)
@@ -4239,6 +6673,9 @@ class MainTesterApp(QMainWindow):
                         elif aoi_is_active:
                             active_color = "#dc3545" if aoi_state == "blocked" else "#1a73e8"
                             active_icon = "🔬"
+                        elif jump_shadow_progress > 0:
+                            active_color = "#ff8c00"
+                            active_icon = "👀"
                         else:
                             active_color = "#dc3545" if (is_current_runtime_step or shown_progress > 0) else "#6c757d"
                             active_icon = "⏳" if (is_current_runtime_step or shown_progress > 0) else "⚪"
